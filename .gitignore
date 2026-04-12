@@ -1,0 +1,15 @@
+# 环境配置（含密钥）
+scripts/.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 评测报告（每次评测产出，保留在本地）
+reports/
+
+# 内部规划文档
+EVAL_PLAN.md
+EVAL_REPORT.md
+DASHBOARD_PLAN.md
+SCORING_REFACTOR_PLAN.md
