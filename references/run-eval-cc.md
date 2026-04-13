@@ -188,27 +188,73 @@ open(f"{run_dir}/judge_results.json", "w").write(json.dumps(results, indent=2, e
 
 ---
 
-## Step 9: 生成报告
+## Step 9: 生成报告（Opus subagent）
 
-基于 Step 7 的评分数据和 Step 3 的运行指标，生成评测报告：
+**必须**通过 Agent 工具启动 **Opus subagent** 写报告，主会话（Sonnet）不要直接写。
 
-```
-reports/eval-report-{run_name}-seth-v2.md
-```
+**为什么用 Opus**：报告阶段需要跨 case 根因归纳、P0/P1 权衡判断、上线决策这类深度推理，Sonnet 可行但质量明显弱。Opus subagent 在隔离 context 中按需读产物，成本比主 Opus 直接写低约 40%。
 
-> run_name 已含时间戳（如 `eval-cc-sonnet-20260412-1430`），报告文件名自动唯一。
+### 9.1 主会话先整理"运行观察"
 
-报告内容：
-1. 总览（E2E 综合分 + 任务完成率）
-2. 逐 Case 评分（按分数从低到高）
-3. 运行指标分析（时长/tokens/caw 命令/错误数/pact 效率 + 异常指标分析）
-4. 逐 Case 详细分析（执行过程 → 问题 → Action Item）
-5. 按场景类型分析
-6. 阶段瓶颈分析（S1/S2/S3 各维度问题）
-7. 改进建议（P0/P1/P2 分级）
+在启动 Opus 之前，主会话自己写一段 briefing（Opus subagent 看不到主会话历史，必须显式传入）：
+
+- 哪些 case 失败/超时/需重试
+- 环境异常（余额、faucet、API 超时、pending 卡住等）
+- 跑了几轮，每轮有没有差异
+- 任何影响分析结论的元信息
+
+保存为临时变量或文件，注入到下面 prompt 的 `## 主会话观察` 段落。
+
+### 9.2 启动 Opus subagent
+
+```python
+Agent(
+    subagent_type="general-purpose",
+    model="opus",
+    description="生成 CAW 评测报告",
+    prompt=f"""基于以下产物写 EVAL_REPORT.md。主会话已跑完评测，你负责深度分析。
+
+## 产物路径
+- Judge 结果: ~/.caw-eval/runs/{{run_name}}/judge_results.json（14 case × 6 维度 score + reasoning）
+- Session 原文: ~/.caw-eval/runs/{{run_name}}/E2E-*.jsonl
+- Skill 源文件: {{repo}}/cobo-agent-wallet/sdk/skills/cobo-agentic-wallet-dev/
+  - SKILL.md, references/pact.md, references/error-handling.md, references/security.md
+- 报告模板参考: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-20260411-sonnet-seth-v2.md
+- 输出路径: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{{run_name}}-seth-v2.md
+
+## 主会话观察（重要，你看不到主会话历史但需要这些信息）
+- 运行轮次: {{n_runs}}
+- 异常: {{observations}}
+- baseline（历史 eval-run-20260408）: E2E=7.23, S1=7.06, S2=8.13, S3=6.41（S3 为主要瓶颈）
+
+## 分析要求
+1. 先 Read judge_results.json 全文，按 e2e_composite 从低到高排序
+2. 低分 case（<0.6）必须 Read 对应 session 追根因；高分 case 不需读 session
+3. 遇到疑似 skill 指令缺陷时，Read 对应 skill 文件验证（不要猜）
+4. P0/P1/P2 按"风险严重度 × 发生频率 × 修复成本"排序，每条附依据
+5. 上线建议三选一：可上 / 有条件上 / 建议延期，附理由
+
+## 产出约束
+- 所有断言必须指向具体 case / tx / 代码行，避免空泛评价
+- 失败 case 用"现象 → 根因 → Action Item"三段式
+- 报告结构参考模板，不要另创结构
+
+## 报告包含
+1. 总览（E2E 综合分 + 任务完成率 + 与 baseline 对比）
+2. 逐 Case 评分（按 e2e_composite 从低到高）
+3. 运行指标（时长/tokens/caw 命令/错误数/pact 效率）
+4. 逐 Case 详细分析（仅低分 case 深入，高分 case 一行总结）
+5. 按场景类型分析（transfer/swap/lend/dca/...）
+6. 阶段瓶颈分析（S1/S2/S3）
+7. 改进建议（P0/P1/P2 分级，每条附理由）
 8. 上线建议
+"""
+)
+```
 
-参考已有报告格式：`reports/eval-report-20260411-sonnet-seth-v2.md`
+**模型选择说明**：
+- 如果只想快速出草稿、人工过后 review，可将 `model="opus"` 改为 `model="sonnet"`（成本再降 60%，报告质量降级约 15%，关键 P0 判断和上线决策质量损失明显）。
+- 若需严格成本控制，先用 `model="sonnet"` 出草稿，再用 `model="opus"` 启第二个 subagent 仅对"P0/P1 建议 + 上线决策"两段做 refine。
 
 ---
 

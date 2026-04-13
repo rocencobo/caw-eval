@@ -1,17 +1,30 @@
 ---
 name: caw-eval
 metadata:
-  version: "2026.04.12.3"
+  version: "2026.04.13.1"
 description: |
-  评测 CAW (Cobo Agentic Wallet) Agent 质量，产出评分数据和分析报告。
+  在本地 Claude Code 中评测 CAW (Cobo Agentic Wallet) Agent 质量，产出评分数据和分析报告。
   Use when: 用户想运行 CAW 评测、跑评测、测试 Skill、评估 Agent 质量、
-  生成评测报告、弱模型验证、模型兼容性测试，
-  或说 "跑评测", "测评 CAW", "eval", "评分", "弱模型验证", "openclaw 评测"。
+  生成评测报告，或说 "跑评测", "测评 CAW", "eval", "评分"。
+  弱模型 / openclaw 评测请使用 caw-eval-openclaw（仅安装在 openclaw 服务器）。
 ---
 
 # CAW Eval
 
 端到端评测 CAW Agent 质量，产出评分数据和分析报告。
+
+## Step 0: 环境识别（必做）
+
+执行任何后续步骤前，先确认当前环境：
+
+```bash
+[[ "$(hostname)" == *openclaw* ]] && echo "env=openclaw" || echo "env=local"
+```
+
+- `env=openclaw`：**本 SKILL（caw-eval）是本地 CC 版本，不能在 openclaw 服务器跑**。告诉用户：
+  > "当前在 openclaw 服务器，本地 CC 评测 SKILL 不适用。请使用 `caw-eval-openclaw`（说'弱模型评测'或'openclaw 评测'触发）。"
+  然后停止。
+- `env=local`：继续下面的流程路由。
 
 ## 流程路由
 
@@ -30,15 +43,20 @@ description: |
 
 ### Claude Code 评测（主要方式）
 
-在本地 Claude Code 中用 Sonnet subagent 并行执行 + 评分。
+在本地 Claude Code 中用 Sonnet subagent 并行执行 + 评分，最后用 Opus subagent 生成分析报告。
 
 ```
 检查环境 → 获取 case 列表 → Sonnet subagent 并行执行 14 case
-→ 收集 session → 上传 Langfuse → LLM Judge 评分 → 应用评分 → 生成报告
+→ 收集 session → 上传 Langfuse → LLM Judge 评分 → 应用评分
+→ Opus subagent 生成报告
 ```
 
 - 时间：约 40 分钟（14 case 并行 4 个）
-- 模型：Sonnet（独立额度，不消耗主额度）
+- 模型分工：
+  - 主会话 / Step 1-8：**Sonnet**（编排与脚本调度，不消耗 Opus 额度）
+  - Step 3 评测 subagent：**Sonnet**（独立周额度）
+  - Step 7 judge subagent：**Sonnet**（或走 API 直调节省 CC 额度）
+  - Step 9 报告 subagent：**Opus**（深度分析，隔离 context 省 token）
 - 详细步骤：[run-eval-cc.md](./references/run-eval-cc.md)
 
 ### Openclaw 弱模型验证

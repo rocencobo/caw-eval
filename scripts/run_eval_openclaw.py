@@ -28,12 +28,19 @@ Openclaw 弱模型评测脚本 — 三层分离方案的服务器端。
 import argparse
 import json
 import shutil
+import socket
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from eval_utils import batch_upload_sessions, get_dataset_items
+
+_METADATA_BASE = "http://metadata.google.internal/computeMetadata/v1"
+_METADATA_HEADERS = {"Metadata-Flavor": "Google"}
+_METADATA_TIMEOUT = 2.0
 
 _SCRIPTS_DIR = Path(__file__).parent
 
@@ -236,6 +243,31 @@ def cmd_upload(
 # ── pack 子命令 ────────────────────────────────────────────────────────────────
 
 
+def _fetch_gce_metadata(path: str) -> str | None:
+    """访问 GCE metadata server，拿不到时返回 None（非 GCE 环境/超时）。"""
+    req = urllib.request.Request(f"{_METADATA_BASE}/{path}", headers=_METADATA_HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=_METADATA_TIMEOUT) as resp:
+            return resp.read().decode("utf-8").strip()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def _build_scp_command(archive: str) -> str:
+    """拼接可直接复制粘贴的 gcloud scp 命令；非 GCE 环境退回占位符模板。"""
+    # 以 zone 探测作为"是否在 GCE 上"的判据：metadata 拿到才信任 hostname 是实例名
+    zone_full = _fetch_gce_metadata("instance/zone")  # 形如 projects/123/zones/asia-east2-b
+    if zone_full is None:
+        return (
+            f"gcloud compute scp <实例名>:{archive} ~/Downloads/ "
+            f"--zone=<zone> --project=<project-id>"
+        )
+    zone = zone_full.rsplit("/", 1)[-1]
+    project = _fetch_gce_metadata("project/project-id") or "<project-id>"
+    instance = socket.gethostname() or "<实例名>"
+    return f"gcloud compute scp {instance}:{archive} ~/Downloads/ --zone={zone} --project={project}"
+
+
 def cmd_pack(run_name: str) -> None:
     """打包 session 文件，方便下载到本地。"""
     run_dir = _RUNS_DIR / run_name
@@ -251,10 +283,8 @@ def cmd_pack(run_name: str) -> None:
 
     size_mb = Path(archive).stat().st_size / 1024 / 1024
     print(f"打包完成: {archive} ({size_mb:.1f} MB)")
-    print("\n下载到本地：")
-    print(
-        f"  gcloud compute scp <实例名>:{archive} ~/Downloads/ --zone=<zone> --project=<project-id>"
-    )
+    print("\n下载到本地（在 Mac 终端执行）：")
+    print(f"  {_build_scp_command(archive)}")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
