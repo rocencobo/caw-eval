@@ -31,7 +31,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from eval_utils import get_dataset_items, get_langfuse_client, link_to_dataset_run, upload_session
+from eval_utils import batch_upload_sessions, get_dataset_items
 
 _SCRIPTS_DIR = Path(__file__).parent
 
@@ -114,6 +114,10 @@ def cmd_prepare(dataset_name: str, item_ids: list[str] | None, output_dir: str |
 def _search_cc_sessions(item_id: str) -> list[Path]:
     """在 Claude Code session 目录中搜索包含指定 item_id eval 标记的文件。
 
+    只检查第一行（首条用户消息）是否包含 marker，避免匹配到 judge session
+    （judge session 在后续内容中读取了 eval session 数据，也包含 marker 文本，
+    但首行是 judge prompt 而非 eval prompt）。
+
     优先返回 subagent session（agent-*.jsonl），因为主 session 包含所有
     subagent 的 prompt 文本，会误匹配多个 item。
     """
@@ -126,8 +130,8 @@ def _search_cc_sessions(item_id: str) -> list[Path]:
             continue
         for jsonl_file in base_dir.rglob("*.jsonl"):
             try:
-                text = jsonl_file.read_text(encoding="utf-8", errors="ignore")
-                if marker in text:
+                first_line = jsonl_file.open(encoding="utf-8", errors="ignore").readline()
+                if marker in first_line:
                     if jsonl_file.name.startswith("agent-"):
                         subagent_files.append(jsonl_file)
                     else:
@@ -216,31 +220,7 @@ def cmd_upload(
         print(f"请先运行: python run_eval_cc.py collect --run-name {run_name}")
         sys.exit(1)
 
-    session_files = sorted(run_dir.glob("E2E-*.jsonl"))
-    if item_ids:
-        session_files = [f for f in session_files if f.stem in item_ids]
-
-    if not session_files:
-        print("[ERROR] 没有找到 session 文件")
-        sys.exit(1)
-
-    lf = get_langfuse_client()
-
-    print(f"=== 上传 {len(session_files)} 个 session (run: {run_name}) ===\n")
-
-    for session_file in session_files:
-        item_id = session_file.stem
-        print(f"  [{item_id}] uploading...")
-
-        trace_id = upload_session(str(session_file), skill)
-        if trace_id:
-            print(f"    [INFO] trace_id: {trace_id}")
-            link_to_dataset_run(lf, dataset_name, item_id, run_name, trace_id)
-        else:
-            print(f"    [ERROR] Upload failed for {item_id}")
-
-    lf.flush()
-    print("\n上传完成")
+    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids)
 
 
 # ── score 子命令 ───────────────────────────────────────────────────────────────
@@ -323,7 +303,7 @@ def cmd_import_sessions(
 
     print(f"\n导入完成: {imported} 个 session")
     print(f"文件位置: {run_dir}")
-    print(f"\n下一步：")
+    print("\n下一步：")
     print(f"  python run_eval_cc.py score --run-name {run_name} --report")
 
 
@@ -369,10 +349,10 @@ def main() -> None:
 
     # ── import-sessions ──────────────────────────────────────────────────────
     p_import = sub.add_parser("import-sessions", help="从外部目录导入 session 文件")
-    p_import.add_argument("--from", dest="from_dir", required=True,
-                          help="源目录（如 /tmp/oc-sessions/）")
-    p_import.add_argument("--run-name", required=True,
-                          help="导入到的 run 名称")
+    p_import.add_argument(
+        "--from", dest="from_dir", required=True, help="源目录（如 /tmp/oc-sessions/）"
+    )
+    p_import.add_argument("--run-name", required=True, help="导入到的 run 名称")
 
     args = parser.parse_args()
 

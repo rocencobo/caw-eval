@@ -22,15 +22,19 @@ python3 run_eval_openclaw.py prepare --dataset-name caw-agent-eval-seth-v2
 
 命令会在 `/tmp/eval-prompts/` 下生成文件。读取 `/tmp/eval-prompts/_all_tasks.txt` 的内容。
 
-## Step 2: 逐个执行任务
+## Step 2: 并行执行任务（3 个并发）
 
-对 `_all_tasks.txt` 中的每个 Task：
-1. 找到 ```prompt 和 ``` 之间的内容
-2. 用 task subagent 执行该内容
-3. 等 task 完成
-4. 继续下一个 Task
+对 `_all_tasks.txt` 中的每个 Task，提取 ```prompt 和 ``` 之间的内容作为 subagent 的 prompt。
 
-**不需要分析结果，不需要上传，只需要逐个执行完所有 Task。**
+**执行策略：始终保持 3 个 task subagent 并行运行**
+1. 一次启动 3 个 task subagent（分别执行不同的 Task）
+2. 任意一个 task 完成后，立即启动下一个未执行的 Task，保持 3 并发
+3. 直到所有 Task 都启动并完成
+
+**注意：**
+- 不要等所有 3 个都完成再启动下一批，必须"完成一个补一个"
+- 不需要分析结果，不需要上传，只需要执行完所有 Task
+- 每个 task subagent 独立运行，互不干扰
 
 ## Step 3: 收集并打包
 

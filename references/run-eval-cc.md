@@ -1,6 +1,6 @@
 # Claude Code 评测：执行步骤
 
-**本文件是 Agent 的执行指南。按 Step 1-8 依次执行即可。**
+**本文件是 Agent 的执行指南。按 Step 1-9 依次执行即可。**
 
 ---
 
@@ -53,6 +53,7 @@ Agent(
 3. {repo}/sdk/skills/cobo-agentic-wallet-dev/references/error-handling.md
 
 ## 评测约束
+- 不得复用已有的 active pact，必须为本次任务创建新的 pact（评测需要评估 pact 协商能力）
 - 提交 pact 时跳过预览和确认，直接 `caw pact submit`
 - `pending_approval` 且 `owner_linked=false` 时自动 `caw pending approve`
 - 无法自动化的阻塞记录原因并跳过
@@ -82,32 +83,48 @@ Agent(
 ```bash
 .venv/bin/python sdk/skills/caw-eval/scripts/run_eval_cc.py collect \
   --dataset-name caw-agent-eval-seth-v2 \
-  --run-name eval-cc-sonnet-$(date +%Y%m%d)
+  --run-name eval-cc-sonnet-$(date +%Y%m%d-%H%M)
 ```
 
 确认 14/14 个 session 都收集到。脚本搜索 `~/.claude/projects/` 下包含 `[EVAL:{item_id}]` 标记的 subagent session 文件。
 
 ---
 
-## Step 5: 生成精细版 judge prompt
+## Step 5: 上传 session 到 Langfuse
+
+```bash
+.venv/bin/python sdk/skills/caw-eval/scripts/run_eval_cc.py upload \
+  --run-name {run_name} \
+  --dataset-name caw-agent-eval-seth-v2
+```
+
+脚本为每个 session 生成独立的 Langfuse trace（UUID），并关联到 dataset run。同时在 run 目录下生成 `trace_map.json`，记录 item_id → trace UUID 的映射，供后续评分使用。
+
+确认输出中每个 item 都显示 `[LINKED]`。
+
+---
+
+## Step 6: 生成精细版 judge prompt
 
 ```bash
 .venv/bin/python sdk/skills/caw-eval/scripts/score_traces.py session \
   --session ~/.caw-eval/runs/{run_name}/ \
   --dataset-name caw-agent-eval-seth-v2 \
-  --dump-judge-requests /tmp/judge_req.json
+  --dump-judge-requests ~/.caw-eval/runs/{run_name}/judge_req.json
 ```
 
-生成 14 个精细版 judge request（含断言结果 + pact 参数 + expected output）。
+生成 14 个精细版 judge request（含断言结果 + pact 参数 + expected output）。judge request 保存在 run 目录下，避免不同 run 之间互相覆盖。
 
 ---
 
-## Step 6: LLM Judge 评分（Sonnet subagent）
+## Step 7: LLM Judge 评分（Sonnet subagent）
 
-对 `/tmp/judge_req.json` 中的每个 request，启动 Sonnet subagent 评分。**每个 session 单独一个 subagent**。
+读取 `~/.caw-eval/runs/{run_name}/judge_req.json` 中的每个 request，启动 Sonnet subagent 评分。**每个 session 单独一个 subagent**。所有 judge 输出文件保存在 run 目录下（`~/.caw-eval/runs/{run_name}/judge_*.json`）。
 
 ```python
-# 读取 /tmp/judge_req.json，对每个 request：
+# 读取 judge_req.json，对每个 request：
+judge_dir = "~/.caw-eval/runs/{run_name}"
+
 Agent(
     model="sonnet",
     run_in_background=True,
@@ -130,7 +147,7 @@ Agent(
 - result_reporting: 结果汇报和错误处理是否合理
 - task_completion: 任务是否完成（0=失败, 0.5=部分, 1=成功。幻觉→0）
 
-将结果写入 /tmp/judge_{item_id}.json，格式：
+将结果写入 {judge_dir}/judge_{item_id}.json，格式：
 {{
   "item_id": "{item_id}",
   "intent_understanding": {{"score": 0.0, "reasoning": "..."}},
@@ -146,37 +163,40 @@ Agent(
 所有 judge 完成后，合并结果：
 
 ```python
-# 合并所有 /tmp/judge_E2E-*.json 到 /tmp/judge_results.json
+# 合并所有 judge_E2E-*.json 到 judge_results.json（同一 run 目录下）
 import json, glob
+run_dir = "~/.caw-eval/runs/{run_name}"
 results = []
-for f in sorted(glob.glob("/tmp/judge_E2E-*.json")):
+for f in sorted(glob.glob(f"{run_dir}/judge_E2E-*.json")):
     results.append(json.loads(open(f).read()))
-open("/tmp/judge_results.json", "w").write(json.dumps(results, indent=2, ensure_ascii=False))
+open(f"{run_dir}/judge_results.json", "w").write(json.dumps(results, indent=2, ensure_ascii=False))
 ```
 
 ---
 
-## Step 7: 应用评分 + 上传 Langfuse
+## Step 8: 应用评分到 Langfuse
 
 ```bash
 .venv/bin/python sdk/skills/caw-eval/scripts/score_traces.py session \
   --session ~/.caw-eval/runs/{run_name}/ \
   --dataset-name caw-agent-eval-seth-v2 \
-  --judge-results /tmp/judge_results.json \
+  --judge-results ~/.caw-eval/runs/{run_name}/judge_results.json \
   --report
 ```
 
-评分自动上传到 Langfuse（含 scores + metadata + reasoning comment）。
+评分写入 Step 5 上传的各 trace（通过 `trace_map.json` 定位），同时在 Langfuse dataset run 页面可按维度查看分数。
 
 ---
 
-## Step 8: 生成报告
+## Step 9: 生成报告
 
 基于 Step 7 的评分数据和 Step 3 的运行指标，生成评测报告：
 
 ```
-reports/eval-report-{date}-sonnet-seth-v2.md
+reports/eval-report-{run_name}-seth-v2.md
 ```
+
+> run_name 已含时间戳（如 `eval-cc-sonnet-20260412-1430`），报告文件名自动唯一。
 
 报告内容：
 1. 总览（E2E 综合分 + 任务完成率）

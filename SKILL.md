@@ -34,7 +34,7 @@ description: |
 
 ```
 检查环境 → 获取 case 列表 → Sonnet subagent 并行执行 14 case
-→ 收集 session → LLM Judge 评分 → 上传 Langfuse → 生成报告
+→ 收集 session → 上传 Langfuse → LLM Judge 评分 → 应用评分 → 生成报告
 ```
 
 - 时间：约 40 分钟（14 case 并行 4 个）

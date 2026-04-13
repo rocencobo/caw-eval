@@ -33,7 +33,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from eval_utils import get_dataset_items, get_langfuse_client, link_to_dataset_run, upload_session
+from eval_utils import batch_upload_sessions, get_dataset_items
 
 _SCRIPTS_DIR = Path(__file__).parent
 
@@ -67,18 +67,18 @@ cobo-agentic-wallet-sandbox skill 已激活。
 
 
 def build_all_tasks_prompt(items: list[dict]) -> str:
-    """构建汇总 prompt——弱模型只需循环调 task subagent。"""
+    """构建汇总 prompt——弱模型并行调 task subagent（3 个并发）。"""
     lines = [
-        "你需要依次执行以下评测任务。对每个任务，使用 task subagent 执行。",
+        "你需要并行执行以下评测任务，使用 task subagent 执行，**始终保持 3 个并发**。",
         "",
         "## 执行方式",
         "",
-        "对下面的每个任务：",
-        "1. 调用 task subagent，prompt 为该任务 ```prompt 和 ``` 之间的完整内容",
-        "2. 等待 task 完成",
-        "3. 继续下一个任务",
+        "1. 一次启动 3 个 task subagent，分别执行 3 个不同的 Task（prompt 为该任务 ```prompt 和 ``` 之间的完整内容）",
+        "2. 任意一个 task 完成后，立即启动下一个未执行的 Task，保持 3 个并发",
+        "3. 重复直到所有 Task 都启动并完成",
         "",
-        "不需要上传、不需要评分、不需要分析结果。只需要逐个执行。",
+        "**不要等 3 个都完成再启动下一批，必须完成一个补一个。**",
+        "不需要上传、不需要评分、不需要分析结果。",
         "",
         f"共 {len(items)} 个任务。",
         "",
@@ -88,7 +88,9 @@ def build_all_tasks_prompt(items: list[dict]) -> str:
 
     for i, item in enumerate(items):
         prompt = build_task_prompt(item)
-        lines.append(f"### Task {i + 1}: {item['id']} ({item['operation_type']} {item['difficulty']})")
+        lines.append(
+            f"### Task {i + 1}: {item['id']} ({item['operation_type']} {item['difficulty']})"
+        )
         lines.append("")
         lines.append("```prompt")
         lines.append(prompt)
@@ -99,6 +101,7 @@ def build_all_tasks_prompt(items: list[dict]) -> str:
 
 
 # ── prepare 子命令 ──────────────────────────────────────────────────────────────
+
 
 def cmd_prepare(dataset_name: str, output_dir: str | None, item_ids: list[str] | None) -> None:
     """生成 task prompt 文件。"""
@@ -120,7 +123,9 @@ def cmd_prepare(dataset_name: str, output_dir: str | None, item_ids: list[str] |
         prompt = build_task_prompt(item)
         prompt_file = out_dir / f"{item['id']}.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
-        print(f"  [{item['id']}] [{item['operation_type']:15s}] [{item['difficulty']}] -> {prompt_file.name}")
+        print(
+            f"  [{item['id']}] [{item['operation_type']:15s}] [{item['difficulty']}] -> {prompt_file.name}"
+        )
 
     # 生成汇总 prompt
     all_prompt = build_all_tasks_prompt(items)
@@ -129,10 +134,11 @@ def cmd_prepare(dataset_name: str, output_dir: str | None, item_ids: list[str] |
 
     print(f"\n文件位置: {out_dir}")
     print(f"汇总 prompt: {all_file}")
-    print(f"\n下一步：在 openclaw 对话中粘贴 _all_tasks.txt 的内容，弱模型会逐个执行 task。")
+    print("\n下一步：在 openclaw 对话中粘贴 _all_tasks.txt 的内容，弱模型会逐个执行 task。")
 
 
 # ── collect 子命令 ─────────────────────────────────────────────────────────────
+
 
 def cmd_collect(
     dataset_name: str,
@@ -211,6 +217,7 @@ def cmd_collect(
 
 # ── upload 子命令 ──────────────────────────────────────────────────────────────
 
+
 def cmd_upload(
     run_name: str,
     dataset_name: str,
@@ -223,34 +230,11 @@ def cmd_upload(
         print(f"[ERROR] Run 目录不存在: {run_dir}")
         sys.exit(1)
 
-    session_files = sorted(run_dir.glob("E2E-*.jsonl"))
-    if item_ids:
-        session_files = [f for f in session_files if f.stem in item_ids]
-
-    if not session_files:
-        print("[ERROR] 没有找到 session 文件")
-        sys.exit(1)
-
-    lf = get_langfuse_client()
-
-    print(f"=== 上传 {len(session_files)} 个 session (run: {run_name}) ===\n")
-
-    for session_file in session_files:
-        item_id = session_file.stem
-        print(f"  [{item_id}] uploading...")
-
-        trace_id = upload_session(str(session_file), skill)
-        if trace_id:
-            print(f"    [INFO] trace_id: {trace_id}")
-            link_to_dataset_run(lf, dataset_name, item_id, run_name, trace_id)
-        else:
-            print(f"    [ERROR] Upload failed for {item_id}")
-
-    lf.flush()
-    print("\n上传完成")
+    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids)
 
 
 # ── pack 子命令 ────────────────────────────────────────────────────────────────
+
 
 def cmd_pack(run_name: str) -> None:
     """打包 session 文件，方便下载到本地。"""
@@ -267,14 +251,17 @@ def cmd_pack(run_name: str) -> None:
 
     size_mb = Path(archive).stat().st_size / 1024 / 1024
     print(f"打包完成: {archive} ({size_mb:.1f} MB)")
-    print(f"\n下载到本地：")
-    print(f"  gcloud compute scp <实例名>:{archive} ~/Downloads/ --zone=<zone> --project=<project-id>")
+    print("\n下载到本地：")
+    print(
+        f"  gcloud compute scp <实例名>:{archive} ~/Downloads/ --zone=<zone> --project=<project-id>"
+    )
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M")
 
     parser = argparse.ArgumentParser(
         description="Openclaw 弱模型评测脚本（三层分离方案的服务器端）",
