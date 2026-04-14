@@ -36,28 +36,43 @@ python3 run_eval_openclaw.py prepare --dataset-name caw-agent-eval-seth-v2
 
 命令会在 `/tmp/eval-prompts/` 下生成文件。读取 `/tmp/eval-prompts/_all_tasks.txt` 的内容。
 
-## Step 2: 并行执行任务（3 个并发）
+## Step 2: 并行执行任务（3 个并发，Wrapper 模式）
 
-对 `_all_tasks.txt` 中的每个 Task，提取 ```prompt 和 ``` 之间的内容作为 subagent 的 prompt。
+对 `_all_tasks.txt` 中的每个 Task，提取 ` ```prompt ` 和 ` ``` ` 之间的内容作为 subagent 的 prompt。
 
-**执行策略：始终保持 3 个 task subagent 并行运行**
-1. 一次启动 3 个 task subagent（分别执行不同的 Task）
-2. 任意一个 task 完成后，立即启动下一个未执行的 Task，保持 3 并发
+**每个 task subagent 是一个 Wrapper**，负责：
+1. 用 `sessions_spawn` 启动真正的 task session
+2. 记录 `childSessionKey`
+3. task 完成后调用 `sessions_history` 导出历史
+4. 将结果写入 `/tmp/eval-sessions/{item_id}.json`
+5. 输出 `WRAPPER DONE: {item_id}` 表示完成
+
+**执行策略：始终保持 3 个 wrapper subagent 并行运行**
+1. 一次启动 3 个 wrapper subagent（分别对应不同的 Task）
+2. 任意一个 wrapper 输出 `WRAPPER DONE:` 后，立即启动下一个未执行的 Task
 3. 直到所有 Task 都启动并完成
 
 **注意：**
 - 不要等所有 3 个都完成再启动下一批，必须"完成一个补一个"
-- 不需要分析结果，不需要上传，只需要执行完所有 Task
-- 每个 task subagent 独立运行，互不干扰
+- 不需要分析结果，不需要上传，只需要所有 wrapper 输出 `WRAPPER DONE:`
+- 每个 wrapper subagent 独立运行，互不干扰
 
-## Step 3: 收集并打包
+## Step 3: 导入、上传并打包
 
-所有 Task 执行完后，运行：
+所有 Wrapper 执行完后，运行：
 
 ```bash
 cd /home/luochong_cobo_com/skills/caw-eval/scripts
-python3 run_eval_openclaw.py collect --run-name eval-oc-$(date +%Y%m%d)
-python3 run_eval_openclaw.py pack --run-name eval-oc-$(date +%Y%m%d)
+
+# 从 openclaw status 读取当前模型（provider/model-name 格式）
+MODEL_FULL=$(openclaw status | awk -F' \| ' 'NR==2{print $3}')
+MODEL_SHORT=$(echo "$MODEL_FULL" | sed 's|.*/||' | cut -d'-' -f1)  # 取模型名首段，如 doubao
+RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
+
+# 从 /tmp/eval-sessions/ 导入 wrapper 写入的 session JSON
+python3 run_eval_openclaw.py import-sessions --run-name "$RUN_NAME"
+python3 run_eval_openclaw.py upload --run-name "$RUN_NAME" --model "$MODEL_SHORT" --model-full "$MODEL_FULL"
+python3 run_eval_openclaw.py pack --run-name "$RUN_NAME"
 ```
 
 告诉用户打包文件的路径和下载命令。

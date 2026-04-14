@@ -211,6 +211,9 @@ def cmd_upload(
     dataset_name: str,
     item_ids: list[str] | None,
     skill: str,
+    model: str,
+    model_full: str,
+    description: str,
 ) -> None:
     """批量上传 run 目录下的 session 文件到 Langfuse。"""
     run_dir = _RUNS_DIR / run_name
@@ -220,7 +223,17 @@ def cmd_upload(
         print(f"请先运行: python run_eval_cc.py collect --run-name {run_name}")
         sys.exit(1)
 
-    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids)
+    # 自动构建 run_description（如未手动指定）
+    run_description = description
+    if not run_description:
+        n_sessions = len(list(run_dir.glob("E2E-*.jsonl")))
+        display_model = model_full or model
+        run_description = (
+            f"Claude Code 评测 | model: {display_model} | dataset: {dataset_name}"
+            f" ({n_sessions} cases) | env: Claude Code"
+        )
+
+    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids, run_description)
 
 
 # ── score 子命令 ───────────────────────────────────────────────────────────────
@@ -338,6 +351,9 @@ def main() -> None:
     p_upload.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
     p_upload.add_argument("--item-id", nargs="*", help="只上传指定 item")
     p_upload.add_argument("--skill", default="cobo-agentic-wallet-dev")
+    p_upload.add_argument("--model", default="sonnet", help="模型短标识，用于 run description（如 sonnet）")
+    p_upload.add_argument("--model-full", default="claude-sonnet-4-6", help="完整模型 ID，写入 run description")
+    p_upload.add_argument("--description", default="", help="自定义 run description（覆盖自动生成）")
 
     # ── score ─────────────────────────────────────────────────────────────────
     p_score = sub.add_parser("score", help="对 session 评分")
@@ -374,6 +390,9 @@ def main() -> None:
             dataset_name=args.dataset_name,
             item_ids=args.item_id,
             skill=args.skill,
+            model=args.model,
+            model_full=args.model_full,
+            description=args.description,
         )
     elif args.cmd == "score":
         cmd_score(

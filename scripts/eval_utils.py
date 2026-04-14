@@ -111,18 +111,23 @@ def link_to_dataset_run(
     dataset_item_id: str,
     run_name: str,
     trace_id: str,
+    run_description: str = "",
 ) -> None:
     """将 Langfuse trace 关联到 dataset item run。
 
     Args:
         dataset_item_id: Langfuse dataset item 的 UUID（不是 metadata id）。
+        run_description: 可选的 run 描述，写入 Langfuse dataset run。
     """
     try:
-        lf.api.dataset_run_items.create(
-            run_name=run_name,
-            dataset_item_id=dataset_item_id,
-            trace_id=trace_id,
-        )
+        kwargs: dict = {
+            "run_name": run_name,
+            "dataset_item_id": dataset_item_id,
+            "trace_id": trace_id,
+        }
+        if run_description:
+            kwargs["run_description"] = run_description
+        lf.api.dataset_run_items.create(**kwargs)
         print(f"    [LINKED] trace={trace_id[:8]}... -> run={run_name}")
     except Exception as e:
         print(f"    [LINK ERROR] {e}")
@@ -134,11 +139,15 @@ def batch_upload_sessions(
     dataset_name: str,
     skill: str = "cobo-agentic-wallet-sandbox",
     item_ids: list[str] | None = None,
+    run_description: str = "",
 ) -> dict[str, str]:
     """批量上传 session 到 Langfuse 并关联 dataset run。
 
     为每个 session 生成独立 trace UUID，上传后写 trace_map.json。
     返回 trace_map（item_id → trace UUID）。
+
+    Args:
+        run_description: 写入 Langfuse dataset run 的描述，建议包含 model/dataset/env 等信息。
     """
     session_files = sorted(run_dir.glob("E2E-*.jsonl"))
     if item_ids:
@@ -185,7 +194,7 @@ def batch_upload_sessions(
             print(f"    [INFO] trace_id: {result_trace_id}")
             langfuse_item_id = meta_to_langfuse.get(item_id)
             if langfuse_item_id:
-                link_to_dataset_run(lf, langfuse_item_id, run_name, result_trace_id)
+                link_to_dataset_run(lf, langfuse_item_id, run_name, result_trace_id, run_description)
             else:
                 print(f"    [WARN] Dataset item not found for {item_id}, skipping link")
         else:

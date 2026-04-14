@@ -739,9 +739,8 @@ def score_session_file(
 
     # 1. 结构化提取
     extraction = extract_structured(session)
-    stage_text = extract_stage_content_from_session(session)
 
-    if not stage_text["full"].strip():
+    if not _session_message_events(session):
         print("    [WARN] Empty session")
         return {"skipped": True, "trace_id": trace_id, "session_path": session_path}
 
@@ -763,18 +762,7 @@ def score_session_file(
         )
 
         # LLM Judge: refusal_quality + task_completion
-        judge_scores = _get_judge_scores(
-            judge_result=judge_result,
-            skip_llm_judge=skip_llm_judge,
-            judge_model=judge_model,
-            user_message=extraction.user_message or item_input.get("user_message", ""),
-            expected=item_expected,
-            metadata=item_metadata,
-            stage_text=stage_text,
-            extraction=extraction,
-            is_refuse=True,
-            assertion_context=f"[gate] correctly_refused={'pass' if refusal_gate.passed else 'fail'} — {refusal_gate.reasoning}",
-        )
+        judge_scores = _get_judge_scores(judge_result=judge_result)
         for s in judge_scores:
             all_dimensions[s.dimension] = s
 
@@ -816,19 +804,7 @@ def score_session_file(
             f"[gate] pact_structure_valid={'pass' if pact_gate.passed else 'fail'} — {pact_gate.reasoning}",
             f"[diag] error_type={diagnostics.error_type}, retry_count={diagnostics.retry_count}",
         ]
-        judge_scores = _get_judge_scores(
-            judge_result=judge_result,
-            skip_llm_judge=skip_llm_judge,
-            judge_model=judge_model,
-            user_message=extraction.user_message or item_input.get("user_message", ""),
-            expected=item_expected,
-            metadata=item_metadata,
-            stage_text=stage_text,
-            extraction=extraction,
-            is_refuse=False,
-            assertion_context="\n".join(assertion_lines),
-            best_pact_submit=best_pact,
-        )
+        judge_scores = _get_judge_scores(judge_result=judge_result)
         for s in judge_scores:
             all_dimensions[s.dimension] = s
 
@@ -963,18 +939,34 @@ def score_session_file(
     # 去除空值
     score_meta = {k: v for k, v in score_meta.items() if v}
 
+    # 统计所有工具调用（含非 caw 命令：Bash/Read/Edit/Agent 等）
+    # session["messages"] 中每个元素是原始事件对象，role/content 在 event["message"] 子对象里
+    tool_call_count = 0
+    for _mid, _ev in session.get("messages", {}).items():
+        _inner = _ev.get("message", {})
+        if _inner.get("role") != "assistant":
+            continue
+        for _blk in _inner.get("content", []):
+            if _blk.get("type") == "toolCall":
+                tool_call_count += 1
+
     # 构建运行指标
     run_metrics = {
         "duration_seconds": item_metadata.get("duration_seconds", 0),
         "token_count": item_metadata.get("token_count", 0),
-        "tool_call_count": item_metadata.get("tool_call_count", 0),
+        "tool_call_count": tool_call_count,
         "caw_command_count": len(extraction.all_tool_calls),
         "pact_submit_count": len(extraction.pact_tool_calls),
         "tx_command_count": len(extraction.tx_tool_calls),
         "error_count": diagnostics.retry_count,
     }
-    # 去除零值
-    run_metrics = {k: v for k, v in run_metrics.items() if v}
+    # 去除 duration/token 的零值（这两个 0 通常是"未采集"而非真实 0）
+    # 其他指标（tool_call/caw_cmd/pact/tx/error）保留 0，因为 0 本身是有意义的信号
+    run_metrics = {
+        k: v
+        for k, v in run_metrics.items()
+        if v or k not in ("duration_seconds", "token_count")
+    }
 
     _lf = lf or _make_langfuse()
     _upload_scores(
@@ -997,55 +989,11 @@ def score_session_file(
 
 def _get_judge_scores(
     judge_result: dict[str, Any] | None,
-    skip_llm_judge: bool,
-    judge_model: str,
-    user_message: str,
-    expected: dict,
-    metadata: dict,
-    stage_text: dict[str, str],
-    extraction: StructuredExtraction,
-    is_refuse: bool,
-    assertion_context: str,
-    best_pact_submit: Any = None,
 ) -> list[DimensionScore]:
-    """获取 LLM Judge 评分：优先用预计算结果，否则实时调用 API，最后 fallback 到默认。"""
-
-    # 1. 预计算结果（--judge-results 传入）
+    """从预计算的 judge 结果中解析评分（CC Subagent 路径）。"""
     if judge_result and not judge_result.get("error"):
         return parse_judge_result_to_scores(judge_result)
-
-    # 2. 跳过 LLM Judge
-    if skip_llm_judge:
-        return []
-
-    # 3. 实时调用 API
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("    [WARN] ANTHROPIC_API_KEY 未设置，跳过 LLM Judge")
-        return []
-
-    try:
-        from judge_cc import call_claude_api
-
-        prompt = build_judge_prompt(
-            user_message=user_message,
-            expected=expected,
-            metadata=metadata,
-            stage_text=stage_text,
-            assertion_context=assertion_context,
-            best_pact_submit=best_pact_submit,
-            is_refuse=is_refuse,
-        )
-        response_text = call_claude_api(
-            system_prompt=JUDGE_SYSTEM_PROMPT,
-            user_prompt=prompt,
-            model=judge_model,
-        )
-        raw = extract_json_from_response(response_text)
-        return parse_judge_result_to_scores(raw)
-    except Exception as e:
-        print(f"    [WARN] LLM Judge 调用失败: {e}")
-        return []
+    return []
 
 
 def session_main() -> None:
@@ -1197,7 +1145,6 @@ def session_main() -> None:
                 item_id = args.item_id or sf.stem
 
                 extraction = extract_structured(session)
-                stage_text = extract_stage_content_from_session(session)
                 pact_gate = check_pact_structure_gate(extraction)
                 diagnostics = classify_diagnostics(extraction)
                 best_pact = get_best_pact_submit(extraction)
@@ -1214,10 +1161,10 @@ def session_main() -> None:
                     user_message=sf_input.get("user_message", ""),
                     expected=sf_expected,
                     metadata=sf_metadata,
-                    stage_text=stage_text,
                     assertion_context="\n".join(assertion_lines),
                     best_pact_submit=best_pact,
                     is_refuse=is_refuse,
+                    session_path=str(sf),
                 )
 
                 req = {

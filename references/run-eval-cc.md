@@ -117,37 +117,25 @@ Agent(
 
 ---
 
-## Step 7: LLM Judge 评分（Sonnet subagent）
+## Step 7: LLM Judge 评分（Sonnet subagent 并行）
 
-读取 `~/.caw-eval/runs/{run_name}/judge_req.json` 中的每个 request，启动 Sonnet subagent 评分。**每个 session 单独一个 subagent**。所有 judge 输出文件保存在 run 目录下（`~/.caw-eval/runs/{run_name}/judge_*.json`）。
+读取 `~/.caw-eval/runs/{run_name}/judge_req.json`，对每个 request 启动一个后台 Sonnet subagent。**始终保持 4-5 个并行**，一个完成就补一个新的。
+
+每个 subagent 通过 Read 工具读取完整 session 文件后评分，结果写入 run 目录下的 `judge_{item_id}.json`。
 
 ```python
-# 读取 judge_req.json，对每个 request：
-judge_dir = "~/.caw-eval/runs/{run_name}"
+# 读取 judge_req.json，对每个 request 启动一个 subagent：
+run_dir = "~/.caw-eval/runs/{run_name}"
 
 Agent(
     model="sonnet",
     run_in_background=True,
     description="Judge {item_id}",
-    prompt="""你是 CAW Agent 评估专家。请对以下 session 文件进行评分。
+    prompt="""你是 CAW Agent 评估专家。请对以下 session 进行评分。
 
-读取 session 文件：{session_path}
+{prompt}  # judge_req.json 中该 item 的 prompt 字段（含 session_path 和评分维度）
 
-**评估上下文**：
-- 用户指令: {user_message}
-- 成功标准: {success_criteria}
-- pact_hints: {pact_hints}
-- 断言结果: {assertion_context}
-
-**评分维度**（0-1 分，每个维度附 reasoning）：
-- intent_understanding: Agent 是否正确理解用户意图（操作类型、资产、链）
-- policies_correctness: pact policies 是否与用户意图匹配（deny_if 限额、scope 最小化）
-- completion_conditions_correctness: 完成条件是否合理（tx_count/time_elapsed）
-- execution_correctness: 命令和参数是否正确
-- result_reporting: 结果汇报和错误处理是否合理
-- task_completion: 任务是否完成（0=失败, 0.5=部分, 1=成功。幻觉→0）
-
-将结果写入 {judge_dir}/judge_{item_id}.json，格式：
+将结果写入 {run_dir}/judge_{item_id}.json，格式：
 {{
   "item_id": "{item_id}",
   "intent_understanding": {{"score": 0.0, "reasoning": "..."}},
@@ -156,14 +144,15 @@ Agent(
   "execution_correctness": {{"score": 0.0, "reasoning": "..."}},
   "result_reporting": {{"score": 0.0, "reasoning": "..."}},
   "task_completion": {{"score": 0.0, "reasoning": "..."}}
-}}"""
+}}
+
+should_refuse case 只需输出 refusal_quality 和 task_completion 两个维度。"""
 )
 ```
 
 所有 judge 完成后，合并结果：
 
 ```python
-# 合并所有 judge_E2E-*.json 到 judge_results.json（同一 run 目录下）
 import json, glob
 run_dir = "~/.caw-eval/runs/{run_name}"
 results = []

@@ -588,6 +588,7 @@ class SessionUploader:
         start_ns = ts_to_ns(session["started_at"])
         all_events = [ev for turn in turns for ev in turn]
         last_ns = ts_to_ns(all_events[-1].get("timestamp")) if all_events else start_ns
+        duration_ms = int((last_ns - start_ns) / 1e6) if start_ns and last_ns else None
 
         tz_cn = timezone(offset=timedelta(hours=8))
         now_cn = datetime.now(tz=tz_cn)
@@ -637,6 +638,7 @@ class SessionUploader:
                     "uploaded_at": now_iso,
                     "session_started_at": _ns_to_iso(start_ns, now_iso),
                     "session_ended_at": _ns_to_iso(last_ns, now_iso),
+                    **({"duration_ms": duration_ms, "duration_seconds": round(duration_ms / 1000, 1)} if duration_ms is not None else {}),
                     "host": f"{getpass.getuser()}@{socket.gethostname()}",
                     **{
                         k: v
@@ -661,8 +663,22 @@ class SessionUploader:
             print(f"[WARN] Langfuse ingestion.batch failed: {e}", file=sys.stderr)
             return None
 
+        # 上传 duration 为 Langfuse Score（数值指标，可在 Dashboard 跨 run 对比）
+        if duration_ms is not None:
+            try:
+                lf.score(
+                    trace_id=sid,
+                    name="duration_seconds",
+                    value=round(duration_ms / 1000, 1),
+                    comment=f"session wall-clock time from first to last event ({duration_ms} ms)",
+                )
+                lf.flush()
+            except Exception as e:
+                print(f"[WARN] Failed to upload duration score: {e}", file=sys.stderr)
+
         total_children = sum(len(t.get("children") or []) for t in turn_children)
         cfg = _get_langfuse_config()
+        duration_str = f"{duration_ms / 1000:.1f}s" if duration_ms is not None else "N/A"
         print(f"\n{'=' * 60}")
         print("  Status:      OK")
         print(f"  Trace Name:  {trace_display_name}")
@@ -671,6 +687,7 @@ class SessionUploader:
         print(f"  Model:       {model}")
         print(f"  Turns:       {len(turn_children)}")
         print(f"  Spans:       {total_children}")
+        print(f"  Duration:    {duration_str}")
         print(f"  Langfuse:    {cfg['host']}")
         print(f"{'=' * 60}")
         return sid
