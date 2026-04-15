@@ -34,7 +34,7 @@ description: |
 |--------|---------|-----------|
 | "跑评测"、"测评 CAW"、"eval"、"评分"、"claude code 评测" | **Claude Code 评测**（默认 dataset: `caw-agent-eval-seth-v2`） | → 读 [run-eval-cc.md](./references/run-eval-cc.md) 按步骤执行 |
 | "recipe 评测"、"跑 recipe"、"recipe eval" | **Claude Code 评测**（dataset: `caw-recipe-eval-seth-v1`） | → 读 [run-eval-cc.md](./references/run-eval-cc.md) 按步骤执行，`--dataset-name caw-recipe-eval-seth-v1` |
-| "弱模型验证"、"openclaw 评测"、"模型兼容性" | **Openclaw 弱模型验证** | 本 SKILL 不直接执行。告诉用户按 [run-eval-openclaw.md](./references/run-eval-openclaw.md) 操作：在服务器 openclaw 中说"跑评测"→ 下载 session 到本地 → 在本地 Claude Code 说"导入 session 并评分" |
+| "弱模型验证"、"openclaw 评测"、"模型兼容性" | **Openclaw 弱模型验证** | → 读 [run-eval-openclaw.md](./references/run-eval-openclaw.md) 按步骤执行（SSH 到服务器跑评测 → 下载 session → 本地评分出报告） |
 
 **默认走 Claude Code 评测**（如果用户没有明确说"弱模型"或"openclaw"）。
 

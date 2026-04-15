@@ -2,7 +2,10 @@
 """
 Openclaw 弱模型评测脚本。
 
-在 Openclaw 服务器上运行，零 LLM 依赖。负责：
+可在 Openclaw 服务器上运行（run/prepare/import-sessions/collect/upload/pack 子命令），
+也可在本地 Mac 上运行 dispatch 子命令以并行调度多台 openclaw 服务器。零 LLM 依赖。
+
+服务器端子命令：
   1. run             — 脚本驱动串行执行评测（推荐）：自动创建隔离 agent、执行 task、收集 session
   2. prepare         — 从 Langfuse 拉 dataset items，生成 task prompt 文件
   3. import-sessions — 从 /tmp/eval-sessions/*.json 导入 session 到 run 目录
@@ -10,10 +13,24 @@ Openclaw 弱模型评测脚本。
   5. upload          — 将收集的 session 上传到 Langfuse
   6. pack            — 打包 session 供本地下载
 
-推荐用法（脚本驱动，串行执行）:
+本地 Mac 调度子命令：
+  7. dispatch        — 并行 SSH 到 N 台 openclaw 服务器，每台跑 `run` 处理一部分 items
+                        （静态轮询分配，每台同时只跑 1 个 task），均上传到同一 Langfuse run
+
+推荐用法（脚本驱动，串行执行 — 单台服务器）:
     python run_eval_openclaw.py run \\
       --run-name eval-oc-doubao-20260415 \\
       --dataset-name caw-agent-eval-seth-v2
+
+并行用法（本地 Mac 调度多台服务器）:
+    python run_eval_openclaw.py dispatch \\
+      --run-name eval-oc-doubao-20260415 \\
+      --dataset-name caw-agent-eval-seth-v2 \\
+      --model doubao --model-full volcengine/doubao-seed-2.0-code \\
+      --server srv1:asia-east2-a:my-project \\
+      --server srv2:asia-east2-c:my-project \\
+      --server srv3:asia-east2-c:my-project \\
+      --server srv4:asia-east2-c:my-project
 
 传统用法（wrapper subagent 模式，需弱模型编排）:
     python run_eval_openclaw.py prepare --dataset-name caw-agent-eval-seth-v2
@@ -26,6 +43,7 @@ Openclaw 弱模型评测脚本。
 import argparse
 import asyncio
 import json
+import shlex
 import shutil
 import socket
 import subprocess
@@ -349,8 +367,13 @@ async def _cmd_run(
     model: str,
     model_full: str,
     description: str,
+    skip_link: bool = False,
 ) -> None:
-    """脚本驱动串行执行评测：为每个 task 创建隔离 agent，通过 CLI 执行，收集 session。"""
+    """脚本驱动串行执行评测：为每个 task 创建隔离 agent，通过 CLI 执行，收集 session。
+
+    Args:
+        skip_link: True 时上传 trace 不创建/关联 dataset run（适合调试少量 case）。
+    """
     items = get_dataset_items(dataset_name)
     if item_ids:
         items = [i for i in items if i["id"] in item_ids]
@@ -412,7 +435,10 @@ async def _cmd_run(
     # upload + pack
     if not skip_upload:
         print("\n--- 上传到 Langfuse ---")
-        cmd_upload(run_name, dataset_name, item_ids, skill, model, model_full, description)
+        cmd_upload(
+            run_name, dataset_name, item_ids, skill, model, model_full, description,
+            skip_link=skip_link,
+        )
 
     if not skip_pack:
         print("\n--- 打包 ---")
@@ -660,8 +686,13 @@ def cmd_upload(
     model: str,
     model_full: str,
     description: str,
+    skip_link: bool = False,
 ) -> None:
-    """上传 session 到 Langfuse。"""
+    """上传 session 到 Langfuse。
+
+    Args:
+        skip_link: True 时只上传 trace，不创建/关联 dataset run（适合调试少量 case）。
+    """
     run_dir = _RUNS_DIR / run_name
     if not run_dir.exists():
         print(f"[ERROR] Run 目录不存在: {run_dir}")
@@ -677,7 +708,9 @@ def cmd_upload(
             f" ({n_sessions} cases) | env: openclaw sandbox"
         )
 
-    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids, run_description)
+    batch_upload_sessions(
+        run_dir, run_name, dataset_name, skill, item_ids, run_description, skip_link=skip_link
+    )
 
 
 # ── pack 子命令 ────────────────────────────────────────────────────────────────
@@ -727,6 +760,170 @@ def cmd_pack(run_name: str) -> None:
     print(f"  {_build_scp_command(archive)}")
 
 
+# ── dispatch 子命令（本地 Mac 端：并行调度多台 openclaw 服务器） ────────────────
+
+
+def _parse_server_spec(spec: str) -> dict:
+    """解析 server 规格 'name:zone:project' 为 dict。"""
+    parts = spec.split(":")
+    if len(parts) != 3:
+        raise ValueError(
+            f"invalid server spec '{spec}', expected format 'name:zone:project'"
+        )
+    return {"name": parts[0], "zone": parts[1], "project": parts[2]}
+
+
+def _build_remote_run_cmd(
+    dataset_name: str,
+    run_name: str,
+    item_ids: list[str],
+    timeout: int,
+    skill: str,
+    model: str,
+    model_full: str,
+) -> str:
+    """构建要在远端 openclaw 服务器上执行的完整 shell 命令（传给 sudo su - ubuntu -c）。"""
+    item_args = " ".join(item_ids)
+    # 远端 model-full 可能含 /，不会破坏 shell；但保险用 shlex.quote 包起来
+    return (
+        "export PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.cobo-agentic-wallet/bin:$PATH; "
+        "cd ~/.agents/skills/caw-eval/scripts && "
+        "python3 run_eval_openclaw.py run "
+        f"--run-name {shlex.quote(run_name)} "
+        f"--dataset-name {shlex.quote(dataset_name)} "
+        f"--item-id {item_args} "
+        f"--timeout {timeout} "
+        f"--skill {shlex.quote(skill)} "
+        f"--model {shlex.quote(model)} "
+        f"--model-full {shlex.quote(model_full)} "
+        "--skip-pack"
+    )
+
+
+async def _ssh_dispatch_one(
+    server: dict,
+    item_ids: list[str],
+    dataset_name: str,
+    run_name: str,
+    timeout: int,
+    skill: str,
+    model: str,
+    model_full: str,
+    log_dir: Path,
+) -> tuple[str, int]:
+    """SSH 到一台 server 串行执行其分配的 items，stdout/stderr 写入 log_dir/{name}.log。"""
+    if not item_ids:
+        return server["name"], 0
+
+    remote_cmd = _build_remote_run_cmd(
+        dataset_name, run_name, item_ids, timeout, skill, model, model_full
+    )
+    ssh_cmd = [
+        "gcloud",
+        "compute",
+        "ssh",
+        "--zone",
+        server["zone"],
+        server["name"],
+        "--tunnel-through-iap",
+        "--project",
+        server["project"],
+        "--ssh-flag=-o ServerAliveInterval=60",
+        "--ssh-flag=-o ServerAliveCountMax=10",
+        "--",
+        f"sudo su - ubuntu -c {shlex.quote(remote_cmd)}",
+    ]
+
+    log_file = log_dir / f"{server['name']}.log"
+    print(f"[DISPATCH→ {server['name']}] items={item_ids} log={log_file}")
+
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(f"# dispatch command:\n# {' '.join(shlex.quote(c) for c in ssh_cmd)}\n\n")
+        f.flush()
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=f,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        rc = await proc.wait()
+
+    print(f"[DISPATCH← {server['name']}] rc={rc}")
+    return server["name"], rc
+
+
+async def _cmd_dispatch(
+    dataset_name: str,
+    run_name: str,
+    item_ids: list[str] | None,
+    servers: list[dict],
+    timeout: int,
+    skill: str,
+    model: str,
+    model_full: str,
+) -> None:
+    """并行 dispatch 评测任务到多台 openclaw 服务器。
+
+    每台分到 items 的一个轮询子集（i % N），各自串行执行（每台同时只跑 1 个 task）。
+    所有服务器用相同 run_name 上传 Langfuse，组成同一个 dataset run。
+    """
+    items = get_dataset_items(dataset_name)
+    if item_ids:
+        items = [i for i in items if i["id"] in item_ids]
+
+    if not items:
+        print("[ERROR] 没有匹配的 items")
+        sys.exit(1)
+
+    if not servers:
+        print("[ERROR] 至少需要一台 --server")
+        sys.exit(1)
+
+    n = len(servers)
+    chunks: list[list[str]] = [[] for _ in range(n)]
+    for i, item in enumerate(items):
+        chunks[i % n].append(item["id"])
+
+    log_dir = _RUNS_DIR / run_name / "dispatch-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== Dispatch (run: {run_name}) ===")
+    print(f"数据集: {dataset_name} ({len(items)} items)")
+    print(f"服务器: {n}, 模型: {model_full or model}")
+    for srv, chunk in zip(servers, chunks):
+        print(f"  → {srv['name']} [{srv['zone']}]: {chunk}")
+    print(f"日志目录: {log_dir}")
+    print()
+
+    coroutines = [
+        _ssh_dispatch_one(
+            srv, chunk, dataset_name, run_name, timeout, skill, model, model_full, log_dir
+        )
+        for srv, chunk in zip(servers, chunks)
+    ]
+    results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+    print("\n=== 完成 ===")
+    failures: list[str] = []
+    for srv, result in zip(servers, results):
+        if isinstance(result, Exception):
+            print(f"  {srv['name']}: EXCEPTION {result}")
+            failures.append(srv["name"])
+        else:
+            _, rc = result
+            status = "OK" if rc == 0 else f"FAIL rc={rc}"
+            print(f"  {srv['name']}: {status}")
+            if rc != 0:
+                failures.append(srv["name"])
+
+    if failures:
+        print(f"\n失败服务器: {failures}")
+        print(f"查看日志: {log_dir}/<server>.log")
+        sys.exit(1)
+
+    print(f"\n所有 server 执行完毕。Langfuse run: {run_name}")
+    print(f"下一步：参考 SKILL-openclaw.md Step 4 评分（score_traces.py langfuse）")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
@@ -753,6 +950,11 @@ def main() -> None:
     )
     p_run.add_argument("--skip-upload", action="store_true", help="跳过上传 Langfuse")
     p_run.add_argument("--skip-pack", action="store_true", help="跳过打包")
+    p_run.add_argument(
+        "--no-link",
+        action="store_true",
+        help="只上传 trace，不创建/关联 dataset run（指定少量 case 调试时用）",
+    )
     p_run.add_argument("--skill", default="cobo-agentic-wallet-sandbox")
     p_run.add_argument("--model", default="doubao", help="模型短标识")
     p_run.add_argument("--model-full", default="", help="完整模型 ID")
@@ -796,10 +998,39 @@ def main() -> None:
     p_upload.add_argument(
         "--description", default="", help="自定义 run description（覆盖自动生成）"
     )
+    p_upload.add_argument(
+        "--no-link",
+        action="store_true",
+        help="只上传 trace，不创建/关联 dataset run",
+    )
 
     # ── pack
     p_pack = sub.add_parser("pack", help="打包 session 文件供下载")
     p_pack.add_argument("--run-name", required=True)
+
+    # ── dispatch（本地 Mac 端：并行调度 N 台 openclaw 服务器）
+    p_dispatch = sub.add_parser(
+        "dispatch",
+        help="本地 Mac 端：并行 SSH 到多台 openclaw 服务器，每台串行执行其分配的 items",
+    )
+    p_dispatch.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
+    p_dispatch.add_argument("--run-name", required=True)
+    p_dispatch.add_argument("--item-id", nargs="*", help="只分发指定 item（否则使用整个 dataset）")
+    p_dispatch.add_argument(
+        "--server",
+        action="append",
+        required=True,
+        metavar="name:zone:project",
+        help="gcloud 服务器规格，可重复；items 轮询分配（i %% N）到各台",
+    )
+    p_dispatch.add_argument(
+        "--timeout", type=int, default=_DEFAULT_TIMEOUT, help="远端单 task 超时（秒）"
+    )
+    p_dispatch.add_argument("--skill", default="cobo-agentic-wallet-sandbox")
+    p_dispatch.add_argument("--model", required=True, help="模型短标识，如 doubao")
+    p_dispatch.add_argument(
+        "--model-full", default="", help="完整模型 ID，如 volcengine/doubao-seed-2.0-code"
+    )
 
     args = parser.parse_args()
 
@@ -818,6 +1049,7 @@ def main() -> None:
                 model=args.model,
                 model_full=args.model_full,
                 description=args.description,
+                skip_link=args.no_link,
             )
         )
     elif args.cmd == "prepare":
@@ -850,9 +1082,24 @@ def main() -> None:
             model=args.model,
             model_full=args.model_full,
             description=args.description,
+            skip_link=args.no_link,
         )
     elif args.cmd == "pack":
         cmd_pack(run_name=args.run_name)
+    elif args.cmd == "dispatch":
+        servers = [_parse_server_spec(s) for s in args.server]
+        asyncio.run(
+            _cmd_dispatch(
+                dataset_name=args.dataset_name,
+                run_name=args.run_name,
+                item_ids=args.item_id,
+                servers=servers,
+                timeout=args.timeout,
+                skill=args.skill,
+                model=args.model,
+                model_full=args.model_full,
+            )
+        )
     else:
         parser.print_help()
         sys.exit(1)

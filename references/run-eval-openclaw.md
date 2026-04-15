@@ -1,119 +1,177 @@
-# Openclaw 弱模型验证：完整说明
+# Openclaw 弱模型验证：执行步骤
 
-## 概述
-
-在 Openclaw 服务器上用弱模型验证 CAW Skill 的兼容性。脚本驱动架构：
-
-```
-服务器（Python 脚本编排）               本地 Claude Code（Sonnet）
-┌───────────────────────────┐       ┌─────────────────────────┐
-│ python run_eval_openclaw  │       │                         │
-│   .py run                 │       │ 导入 session            │
-│                           │       │ LLM Judge 评分          │
-│ 串行执行每个 task:         │       │ 上传 Langfuse           │
-│   agents add → agent CLI  │       │ 生成报告                │
-│   → collect → delete      │       │                         │
-│   → upload → pack         │       │                         │
-└───────────────────────────┘       └─────────────────────────┘
-         ↓ gcloud scp
-```
-
-脚本通过 `openclaw agent` CLI 驱动弱模型逐个执行评测 task，弱模型不参与编排。
+**本文件是 Agent 的执行指南。按 Step 1-4 依次执行即可。**
 
 ---
 
-## 前置条件（一次性准备）
+## 流程概览
 
-### 服务器环境
-
-```bash
-# 1. caw 环境就绪
-export PATH="$HOME/.cobo-agentic-wallet/bin:$PATH"
-caw status          # healthy=true, signing_ready=true
-caw wallet balance  # SETH >= 0.2
-
-# 2. 充值测试币（如果余额不足）
-# 从公共 Sepolia faucet 领取：
-#   https://www.alchemy.com/faucets/ethereum-sepolia（每次 0.5 SETH）
-#   https://faucets.chain.link/sepolia（每次 0.1 SETH）
-
-# 3. cobo-agentic-wallet-sandbox skill 已安装
-npx skills add cobosteven/cobo-agent-wallet-manual --skill cobo-agentic-wallet-sandbox --yes --global
-
-# 4. 评测脚本已部署到服务器
-# 需要以下文件：
-#   run_eval_openclaw.py
-#   eval_utils.py
-#   upload_session.py
-#   .env（含 Langfuse 凭证）
-# 放到统一目录，如 /home/luochong_cobo_com/skills/caw-eval/scripts/
-
-# 5. Python 依赖
-pip install langfuse python-dotenv
-
-# 6. openclaw CLI 在 PATH 中
-which openclaw  # 应输出路径，如 /home/ubuntu/.npm-global/bin/openclaw
+```
+服务器端                        本地端（Claude Code）
+─────────                       ────────────────────
+Step 1: SSH → run               Step 2: langfuse 评分（直接读 Langfuse API）
+  执行 task                       生成 judge prompt（含 session 内容）
+  上传 Langfuse                Step 3: CC subagent 评分
+  （session JSONL 留在服务器）   Step 4: 应用评分 + 生成报告
 ```
 
-### 本地环境
-
-确认 Claude Code 能访问项目代码即可。无需额外准备。
+session 数据通过 Langfuse API 读取，**无需 scp 下载或导入本地**。
 
 ---
 
-## 操作流程
+## 服务器连接信息
 
-### 第一步：在服务器上跑评测
+```
+SSH: gcloud compute ssh --zone "asia-east2-a" "luochong-openclew-dev-v1-20260318-070641" --tunnel-through-iap --project "openclaw-keq9xwm4"
+用户: ubuntu（通过 sudo su - ubuntu 切换）
+脚本目录: ~/.agents/skills/caw-eval/scripts/
+openclaw: /home/ubuntu/.npm-global/bin/openclaw
+caw: /home/ubuntu/.cobo-agentic-wallet/bin/caw
+```
 
-在服务器终端运行（不需要通过 openclaw 对话）：
+如果 `gcloud` 报 Python 模块错误，命令前加 `export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.11`。
+
+---
+
+## Step 1: 在服务器上执行评测
+
+通过 SSH 在 Openclaw 服务器上运行评测脚本。脚本自动为每个 task 创建隔离 agent、通过 `openclaw agent` CLI 驱动弱模型执行、收集 session、上传 Langfuse、打包。
+
+先获取模型信息：
 
 ```bash
-cd /home/luochong_cobo_com/skills/caw-eval/scripts
+export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.11
 
-DATASET_NAME=caw-agent-eval-seth-v2
-MODEL_FULL=$(openclaw status | awk -F' | ' 'NR==2{print $3}')
-MODEL_SHORT=$(echo "$MODEL_FULL" | sed 's|.*/||' | cut -d'-' -f1)
-RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
-
-python3 run_eval_openclaw.py run \
-  --run-name "$RUN_NAME" \
-  --dataset-name "$DATASET_NAME" \
-  --model "$MODEL_SHORT" \
-  --model-full "$MODEL_FULL"
+gcloud compute ssh --zone "asia-east2-a" "luochong-openclew-dev-v1-20260318-070641" \
+  --tunnel-through-iap --project "openclaw-keq9xwm4" \
+  -- "sudo su - ubuntu -c 'export PATH=/home/ubuntu/.npm-global/bin:\$PATH; openclaw status 2>&1 | head -5'"
 ```
 
-脚本自动执行：
-1. 从 Langfuse 拉取 dataset items
-2. 对每个 item 串行执行：创建隔离 agent → 通过 `openclaw agent` CLI 发送 task → 收集 session → 删除 agent
-3. 上传 session 到 Langfuse
-4. 打包 session 文件并输出下载命令
-
-完成后会输出打包文件路径和下载命令。
-
-> **部分 item 失败时**：脚本会输出失败项列表和重跑命令，用 `--item-id` 参数只重跑失败项。
-
-### 第二步：下载到本地
-
-在 Mac 终端执行脚本给出的下载命令：
+然后执行评测：
 
 ```bash
-gcloud compute scp <实例名>:/tmp/eval-oc-*.tar.gz ~/Downloads/ \
-  --zone=<zone> --project=<project-id>
-
-mkdir -p /tmp/oc-sessions
-tar xzf ~/Downloads/eval-oc-*.tar.gz -C /tmp/oc-sessions/
+gcloud compute ssh --zone "asia-east2-a" "luochong-openclew-dev-v1-20260318-070641" \
+  --tunnel-through-iap --project "openclaw-keq9xwm4" \
+  -- "sudo su - ubuntu -c 'export PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.cobo-agentic-wallet/bin:\$PATH; \
+  cd ~/.agents/skills/caw-eval/scripts && \
+  python3 run_eval_openclaw.py run \
+    --run-name {run_name} \
+    --dataset-name {dataset_name} \
+    --model {model_short} \
+    --model-full {model_full} \
+    --timeout 600 \
+    2>&1'"
 ```
 
-### 第三步：在 Claude Code 中评分
+**参数说明**：
+- `{run_name}`: 格式 `eval-oc-{model}-{YYYYMMDD-HHMM}`，如 `eval-oc-doubao-20260415-1030`
+- `{dataset_name}`: 默认 `caw-agent-eval-seth-v2`，Ethereum Sepolia 用 `caw-agent-eval-eth-v1`
+- `{model_short}`: 从 `openclaw status` 获取，如 `doubao`
+- `{model_full}`: 完整模型 ID，如 `volcengine/doubao-seed-2.0-code`
+- `--item-id E2E-01L1 E2E-06L1`: 可选，指定只跑部分 item
+- `--skip-pack`: 推荐加上（不再需要打包，session 数据已在 Langfuse）
 
-在 Claude Code 中说：
+**注意**：
+- 每个 task 耗时约 2-8 分钟，全量 14-20 个 case 串行约 1-3 小时
+- SSH 工具超时设置：`timeout: 600000`（10 分钟）+ `run_in_background: true`
+- 完成后 session 已上传 Langfuse 关联到 dataset run，可在 UI 查看
 
+**部分 item 失败**：脚本会输出失败项和重跑命令，用 `--item-id` 重跑。
+
+---
+
+## Step 2: 生成 judge requests（本地，从 Langfuse 拉数据）
+
+```bash
+cd <repo>/cobo-agent-wallet
+
+.venv/bin/python sdk/skills/caw-eval/scripts/score_traces.py langfuse \
+  --run-name {run_name} \
+  --dataset-name {dataset_name} \
+  --dump-judge-requests ~/.caw-eval/runs/{run_name}/judge_req.json
 ```
-读 cobo-agent-wallet/sdk/skills/caw-eval/SKILL.md
-导入 /tmp/oc-sessions/ 的 openclaw session，run name 为 eval-oc-doubao-YYYYMMDD-HHMM，然后评分出报告
+
+脚本自动：
+1. 从 Langfuse 拉取 dataset run 中的所有 trace
+2. 对每个 trace 拉取 observations，重建 StructuredExtraction
+3. 跑代码断言（pact gate、diagnostics）
+4. 生成 judge prompt（**session 内容直接嵌入 prompt 里，不依赖本地文件**）
+
+输出 `judge_req.json`，包含每个 item 的 `prompt` 和 `system_prompt`。
+
+---
+
+## Step 3: LLM Judge 评分（CC subagent 并行）
+
+读取 `judge_req.json`，对每个 request 启动后台 Sonnet subagent 评分。**始终保持 4-5 个并行**。
+
+```python
+# 读取 judge_req.json，对每个 request 启动一个 subagent：
+import json
+run_dir = "~/.caw-eval/runs/{run_name}"
+requests = json.loads(open(f"{run_dir}/judge_req.json").read())
+
+# 对每个 request 启动后台 subagent
+for req in requests:
+    Agent(
+        model="sonnet",
+        run_in_background=True,
+        description=f"Judge {req['item_id']}",
+        prompt=f"""{req['system_prompt']}
+
+{req['prompt']}
+
+将 JSON 评分结果（严格按上面要求的格式）写入：{run_dir}/judge_{req['item_id']}.json"""
+    )
 ```
 
-Claude Code 自动执行：import-sessions → LLM Judge 评分 → 上传 Langfuse → 生成报告。
+**重要**：openclaw 模式下 prompt 已经包含完整 session 内容，subagent 不需要再 Read 任何文件。直接根据 prompt 中嵌入的 session 内容评分即可。
+
+所有 judge 完成后，合并结果：
+
+```bash
+cd ~/.caw-eval/runs/{run_name}
+python3 -c "
+import json, glob
+results = []
+for f in sorted(glob.glob('judge_E2E-*.json')):
+    results.append(json.loads(open(f).read()))
+open('judge_results.json', 'w').write(json.dumps(results, indent=2, ensure_ascii=False))
+print(f'merged {len(results)} judge results')
+"
+```
+
+---
+
+## Step 4: 应用评分到 Langfuse
+
+```bash
+.venv/bin/python sdk/skills/caw-eval/scripts/score_traces.py langfuse \
+  --run-name {run_name} \
+  --dataset-name {dataset_name} \
+  --judge-results ~/.caw-eval/runs/{run_name}/judge_results.json \
+  --report
+```
+
+脚本自动：
+1. 重新从 Langfuse 拉 trace + observations
+2. 跑断言 + 应用预计算的 judge 评分
+3. 计算 S1/S2/S3/TC/E2E 综合分
+4. 上传所有维度评分到 Langfuse trace（含 ClickHouse 查询元数据）
+5. 打印汇总
+
+---
+
+## Step 5: 生成报告（Opus subagent）
+
+参考 [run-eval-cc.md](./run-eval-cc.md) 的 Step 9。启动 Opus subagent 写报告，但 openclaw 模式下：
+- **session 数据来自 Langfuse**：subagent 用 Langfuse Python SDK 拉取（参考 `score_traces.py` 的 `_fetch_observations` 实现）
+- 或者：把 Step 2 生成的 `judge_req.json`（含 session_text）传给 Opus 作为分析素材
+
+报告输出到：
+```
+cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{run_name}.md
+```
 
 ---
 
@@ -133,14 +191,9 @@ Claude Code 自动执行：import-sessions → LLM Judge 评分 → 上传 Langf
 
 | 脚本 | 子命令 | 说明 |
 |------|--------|------|
-| `run_eval_openclaw.py` | `run` | **推荐**。脚本驱动串行执行：为每个 task 创建隔离 agent、通过 CLI 执行、收集 session、清理 agent |
-| | `prepare` | 从 Langfuse 拉 items，生成 task prompt 文件（传统 wrapper 模式用） |
-| | `import-sessions` | 从 /tmp/eval-sessions/ 导入 wrapper 写入的 session JSON |
-| | `collect` | 在 openclaw session 目录中 grep 搜索 eval 标记，收集到统一目录 |
-| | `upload` | 上传 session 到 Langfuse |
-| | `pack` | 打包 session 目录为 tar.gz，输出下载命令 |
-| `eval_utils.py` | — | 公共工具（Langfuse 客户端/数据集操作/上传函数） |
-| `upload_session.py` | — | session.jsonl → Langfuse trace |
+| `run_eval_openclaw.py` | `run` | **服务器端**。脚本驱动串行执行 + 上传 Langfuse |
+| `score_traces.py` | `langfuse` | **本地端**。从 Langfuse 拉 trace + observations 重建评分数据，无需本地 session 文件 |
+| `score_traces.py` | `session` | **本地端**（CC 评测用）。读本地 .jsonl 评分 |
 
 ---
 
@@ -148,11 +201,11 @@ Claude Code 自动执行：import-sessions → LLM Judge 评分 → 上传 Langf
 
 | 问题 | 解决 |
 |------|------|
-| `openclaw: command not found` | 确认 openclaw 在 PATH 中（`export PATH=/home/ubuntu/.npm-global/bin:$PATH`）|
-| `run` 子命令 agents add 失败 | 检查 `openclaw agents list`，确认没有同名 agent 残留；手动 `openclaw agents delete eval-xxx --force` 清理 |
-| task 超时 | 默认 600 秒，DeFi 操作可能更久，用 `--timeout 900` 增加超时 |
-| session 文件格式不对 | `run` 子命令直接收集 otel JSONL，无需转换；如果用传统 `collect` 模式，确认文件名以 `E2E-` 开头 |
-| prepare 报 "Langfuse credentials not set" | 检查 `.env` 文件是否存在且凭证正确 |
-| gcloud scp 报错 | 确认 zone/project-id 正确（在服务器上查 metadata） |
-| 本地导入后评分报错 | 确认 session 文件是 `.jsonl` 格式，文件名以 `E2E-` 开头 |
-| 部分 task 失败需要重跑 | 用 `--item-id E2E-01L1 E2E-02L1` 只重跑指定 item，run 目录会累积结果 |
+| gcloud ssh 报 Python 错误 | `export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.11` |
+| SSH 超时 | 增加 Bash 工具 timeout（600000 = 10 分钟），或用 `run_in_background=True` |
+| `openclaw: command not found` | SSH 中确认 PATH 包含 `/home/ubuntu/.npm-global/bin` |
+| Langfuse 凭证缺失 | 检查 `~/.agents/skills/caw-eval/scripts/.env`（服务器）和本地 `.env` |
+| `langfuse` 子命令报 v2 API 不可用 | 已用 `legacy.observations_v1` API，无影响。如仍报错检查 langfuse 包版本 |
+| task 超时 | `--timeout 900` 增加单 task 超时 |
+| 部分 item 失败 | 用 `--item-id` 重跑失败项 |
+| Langfuse 拉到的 trace 缺 observations | 确认 `run` 子命令的 upload 步骤未跳过（`--skip-upload` 关掉就行） |

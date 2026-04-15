@@ -215,8 +215,13 @@ def cmd_upload(
     model: str,
     model_full: str,
     description: str,
+    skip_link: bool = False,
 ) -> None:
-    """批量上传 run 目录下的 session 文件到 Langfuse。"""
+    """批量上传 run 目录下的 session 文件到 Langfuse。
+
+    Args:
+        skip_link: True 时只上传 trace，不创建/关联 dataset run（适合调试少量 case）。
+    """
     run_dir = _RUNS_DIR / run_name
 
     if not run_dir.exists():
@@ -234,7 +239,9 @@ def cmd_upload(
             f" ({n_sessions} cases) | env: Claude Code"
         )
 
-    batch_upload_sessions(run_dir, run_name, dataset_name, skill, item_ids, run_description)
+    batch_upload_sessions(
+        run_dir, run_name, dataset_name, skill, item_ids, run_description, skip_link=skip_link
+    )
 
 
 # ── score 子命令 ───────────────────────────────────────────────────────────────
@@ -547,6 +554,11 @@ def main() -> None:
     p_upload.add_argument(
         "--description", default="", help="自定义 run description（覆盖自动生成）"
     )
+    p_upload.add_argument(
+        "--no-link",
+        action="store_true",
+        help="只上传 trace，不创建/关联 dataset run（指定少量 case 调试时用）",
+    )
 
     # ── score ─────────────────────────────────────────────────────────────────
     p_score = sub.add_parser("score", help="对 session 评分")
@@ -592,6 +604,7 @@ def main() -> None:
             model=args.model,
             model_full=args.model_full,
             description=args.description,
+            skip_link=args.no_link,
         )
     elif args.cmd == "score":
         cmd_score(
