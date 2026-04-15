@@ -14,8 +14,9 @@ Openclaw 弱模型评测脚本。
   6. pack            — 打包 session 供本地下载
 
 本地 Mac 调度子命令：
-  7. dispatch        — 并行 SSH 到 N 台 openclaw 服务器，每台跑 `run` 处理一部分 items
-                        （静态轮询分配，每台同时只跑 1 个 task），均上传到同一 Langfuse run
+  7. dispatch        — 并行 SSH 到 N 台 openclaw 服务器，每台作为 worker 动态从任务队列取 item 执行
+                        （默认动态队列模式：空闲服务器自动取下一个任务，充分利用服务器资源）
+                        加 --static 退化为静态轮询分配（i % N），fire-and-forget 时自动使用静态模式
 
 推荐用法（脚本驱动，串行执行 — 单台服务器）:
     python run_eval_openclaw.py run \\
@@ -186,6 +187,38 @@ def build_all_tasks_prompt(items: list[dict]) -> str:
 # ── run 子命令（脚本驱动串行执行） ─────────────────────────────────────────────
 
 
+_CAW_BIN = os.path.expanduser("~/.cobo-agentic-wallet/bin/caw")
+
+
+async def _revoke_active_pacts(item_id: str) -> None:
+    """Revoke 所有 active pact，确保每个 eval item 从干净的 pact 状态开始。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _CAW_BIN, "pact", "list", "--status", "active",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        if proc.returncode != 0:
+            return
+        pact_data = json.loads(stdout.decode())
+        pacts = pact_data.get("result", {}).get("pacts", [])
+        for p in pacts:
+            pid = p.get("id", "")
+            if not pid:
+                continue
+            rp = await asyncio.create_subprocess_exec(
+                _CAW_BIN, "pact", "revoke", pid,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(rp.communicate(), timeout=10)
+        if pacts:
+            print(f"  [{item_id}] revoked {len(pacts)} active pact(s)")
+    except Exception:
+        pass  # 清理失败不阻塞评测
+
+
 async def _run_openclaw(
     openclaw_bin: str,
     args: list[str],
@@ -259,6 +292,17 @@ async def _run_single_task(
     actual_agent_id = ""
 
     try:
+        # 0. 预清理残留 agent（上次异常退出或 delete 失败时会留下同名 agent，
+        #    导致 agents add 报 "already exists"；直接忽略失败）
+        await _run_openclaw(
+            openclaw_bin,
+            ["agents", "delete", agent_name.lower(), "--force"],
+            timeout=15,
+        )
+
+        # 0.5 清理所有 active pact（避免 agent 复用旧 pact 导致评测无法检测 pact submit）
+        await _revoke_active_pacts(item_id)
+
         # 1. 创建隔离 agent
         rc, out, err = await _run_openclaw(
             openclaw_bin,
@@ -781,14 +825,21 @@ def _build_remote_run_cmd(
     skill: str,
     model: str,
     model_full: str,
+    *,
+    fire_and_forget: bool = False,
+    server_name: str = "",
 ) -> str:
-    """构建要在远端 openclaw 服务器上执行的完整 shell 命令（传给 sudo su - ubuntu -c）。"""
+    """构建要在远端 openclaw 服务器上执行的完整 shell 命令（传给 sudo su - ubuntu -c）。
+
+    fire_and_forget=True 时：用 nohup 后台执行，SSH 在 echo 远端 PID 后立即返回。
+    日志写到远端 ~/.caw-eval/runs/{run_name}/{server_name}.nohup.log。
+    """
     item_args = " ".join(item_ids)
     # 远端 model-full 可能含 /，不会破坏 shell；但保险用 shlex.quote 包起来
-    return (
+    core_cmd = (
         "export PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.cobo-agentic-wallet/bin:$PATH; "
         "cd ~/.agents/skills/caw-eval/scripts && "
-        "python3 run_eval_openclaw.py run "
+        "python3 -u run_eval_openclaw.py run "
         f"--run-name {shlex.quote(run_name)} "
         f"--dataset-name {shlex.quote(dataset_name)} "
         f"--item-id {item_args} "
@@ -797,6 +848,15 @@ def _build_remote_run_cmd(
         f"--model {shlex.quote(model)} "
         f"--model-full {shlex.quote(model_full)} "
         "--skip-pack"
+    )
+    if not fire_and_forget:
+        return core_cmd
+    # fire-and-forget：nohup 后台运行，echo PID 后 SSH 立即返回
+    # 本地日志文件（.log）只记录 PID 和 nohup log 路径；实际输出在远端 nohup log
+    log_path = f"~/.caw-eval/runs/{run_name}/{server_name}.nohup.log"
+    return (
+        f"mkdir -p ~/.caw-eval/runs/{shlex.quote(run_name)}; "
+        f"nohup bash -c {shlex.quote(core_cmd)} > {log_path} 2>&1 & echo $!"
     )
 
 
@@ -810,13 +870,21 @@ async def _ssh_dispatch_one(
     model: str,
     model_full: str,
     log_dir: Path,
+    *,
+    fire_and_forget: bool = False,
 ) -> tuple[str, int]:
-    """SSH 到一台 server 串行执行其分配的 items，stdout/stderr 写入 log_dir/{name}.log。"""
+    """SSH 到一台 server 串行执行其分配的 items，stdout/stderr 写入 log_dir/{name}.log。
+
+    fire_and_forget=True 时：远端用 nohup 后台启动，SSH 在拿到 PID 后立即返回。
+    本地日志只记录 PID + 远端 nohup log 路径，实际输出在远端。
+    """
     if not item_ids:
         return server["name"], 0
 
     remote_cmd = _build_remote_run_cmd(
-        dataset_name, run_name, item_ids, timeout, skill, model, model_full
+        dataset_name, run_name, item_ids, timeout, skill, model, model_full,
+        fire_and_forget=fire_and_forget,
+        server_name=server["name"],
     )
     ssh_cmd = [
         "gcloud",
@@ -837,6 +905,27 @@ async def _ssh_dispatch_one(
     log_file = log_dir / f"{server['name']}.log"
     print(f"[DISPATCH→ {server['name']}] items={item_ids} log={log_file}")
 
+    if fire_and_forget:
+        # FF 模式：SSH 只等远端 echo PID，不等进程结束
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        pid = stdout.decode().strip()
+        nohup_log = f"~/.caw-eval/runs/{run_name}/{server['name']}.nohup.log"
+        with log_file.open("w", encoding="utf-8") as f:
+            f.write(f"# fire-and-forget dispatch\n")
+            f.write(f"# command: {' '.join(shlex.quote(c) for c in ssh_cmd)}\n")
+            f.write(f"# remote PID: {pid}\n")
+            f.write(f"# nohup log (on server): {nohup_log}\n")
+            if stderr.strip():
+                f.write(f"# stderr: {stderr.decode().strip()}\n")
+        print(f"[DISPATCH← {server['name']}] fire-and-forget PID={pid}")
+        print(f"  nohup log (on server): {nohup_log}")
+        return server["name"], 0
+
     with log_file.open("w", encoding="utf-8") as f:
         f.write(f"# dispatch command:\n# {' '.join(shlex.quote(c) for c in ssh_cmd)}\n\n")
         f.flush()
@@ -851,6 +940,71 @@ async def _ssh_dispatch_one(
     return server["name"], rc
 
 
+async def _dynamic_worker(
+    server: dict,
+    queue: asyncio.Queue,
+    item_results: dict,
+    dataset_name: str,
+    run_name: str,
+    timeout: int,
+    skill: str,
+    model: str,
+    model_full: str,
+    log_dir: Path,
+) -> str:
+    """动态 worker：从队列持续取 item 执行，直到队列空为止。
+
+    每次只跑 1 个 item，完成后立即从队列取下一个，实现服务器间负载均衡。
+    item_results[item_id] = (server_name, rc) 记录每个 item 的执行结果。
+    """
+    while True:
+        try:
+            item_id = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        remote_cmd = _build_remote_run_cmd(
+            dataset_name, run_name, [item_id], timeout, skill, model, model_full,
+            fire_and_forget=False,
+            server_name=server["name"],
+        )
+        ssh_cmd = [
+            "gcloud",
+            "compute",
+            "ssh",
+            "--zone",
+            server["zone"],
+            server["name"],
+            "--tunnel-through-iap",
+            "--project",
+            server["project"],
+            "--ssh-flag=-o ServerAliveInterval=60",
+            "--ssh-flag=-o ServerAliveCountMax=10",
+            "--",
+            f"sudo su - ubuntu -c {shlex.quote(remote_cmd)}",
+        ]
+
+        log_file = log_dir / f"{server['name']}-{item_id}.log"
+        print(f"[DISPATCH→ {server['name']}] item={item_id} log={log_file.name}")
+
+        with log_file.open("w", encoding="utf-8") as f:
+            f.write(f"# dispatch command:\n# {' '.join(shlex.quote(c) for c in ssh_cmd)}\n\n")
+            f.flush()
+            proc = await asyncio.create_subprocess_exec(
+                *ssh_cmd,
+                stdout=f,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            rc = await proc.wait()
+
+        status = "OK" if rc == 0 else f"FAIL rc={rc}"
+        print(f"[DISPATCH← {server['name']}] item={item_id} {status}")
+        item_results[item_id] = (server["name"], rc)
+        queue.task_done()
+
+    return server["name"]
+
+
 async def _cmd_dispatch(
     dataset_name: str,
     run_name: str,
@@ -860,11 +1014,17 @@ async def _cmd_dispatch(
     skill: str,
     model: str,
     model_full: str,
+    *,
+    fire_and_forget: bool = False,
+    static: bool = False,
 ) -> None:
     """并行 dispatch 评测任务到多台 openclaw 服务器。
 
-    每台分到 items 的一个轮询子集（i % N），各自串行执行（每台同时只跑 1 个 task）。
-    所有服务器用相同 run_name 上传 Langfuse，组成同一个 dataset run。
+    默认动态队列模式（非 fire-and-forget）：所有 items 放入队列，每台服务器作为 worker
+    持续取任务执行，完成一个立即取下一个，充分利用空闲服务器。
+
+    fire_and_forget=True 或 static=True 时：退化为静态轮询分配（i % N），
+    各台服务器预先分配固定 chunk，SSH 启动后（fire-and-forget 时）立即返回。
     """
     items = get_dataset_items(dataset_name)
     if item_ids:
@@ -879,49 +1039,97 @@ async def _cmd_dispatch(
         sys.exit(1)
 
     n = len(servers)
-    chunks: list[list[str]] = [[] for _ in range(n)]
-    for i, item in enumerate(items):
-        chunks[i % n].append(item["id"])
-
     log_dir = _RUNS_DIR / run_name / "dispatch-logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== Dispatch (run: {run_name}) ===")
+    # ── 静态分配路径（fire-and-forget 或显式 --static）────────────────────────
+    if fire_and_forget or static:
+        chunks: list[list[str]] = [[] for _ in range(n)]
+        for i, item in enumerate(items):
+            chunks[i % n].append(item["id"])
+
+        mode = "fire-and-forget" if fire_and_forget else "static"
+        print(f"=== Dispatch [{mode}] (run: {run_name}) ===")
+        print(f"数据集: {dataset_name} ({len(items)} items)")
+        print(f"服务器: {n}, 模型: {model_full or model}")
+        for srv, chunk in zip(servers, chunks):
+            print(f"  → {srv['name']} [{srv['zone']}]: {chunk}")
+        print(f"日志目录: {log_dir}")
+        print()
+
+        coroutines = [
+            _ssh_dispatch_one(
+                srv, chunk, dataset_name, run_name, timeout, skill, model, model_full, log_dir,
+                fire_and_forget=fire_and_forget,
+            )
+            for srv, chunk in zip(servers, chunks)
+        ]
+        static_results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+        print("\n=== 完成 ===")
+        failures: list[str] = []
+        for srv, result in zip(servers, static_results):
+            if isinstance(result, Exception):
+                print(f"  {srv['name']}: EXCEPTION {result}")
+                failures.append(srv["name"])
+            else:
+                _, rc = result  # type: ignore[misc]
+                status = "OK" if rc == 0 else f"FAIL rc={rc}"
+                print(f"  {srv['name']}: {status}")
+                if rc != 0:
+                    failures.append(srv["name"])
+
+        if failures:
+            print(f"\n失败服务器: {failures}")
+            print(f"查看日志: {log_dir}/<server>.log")
+            if fire_and_forget:
+                print(f"或查看 nohup log：ssh 到各服务器看 ~/.caw-eval/runs/{run_name}/<server>.nohup.log")
+        else:
+            print(f"\n所有 server 执行完毕。Langfuse run: {run_name}")
+            print(f"下一步：参考 SKILL-openclaw.md Step 4 评分（score_traces.py langfuse）")
+        return
+
+    # ── 动态队列路径（默认）────────────────────────────────────────────────────
+    print(f"=== Dispatch [dynamic] (run: {run_name}) ===")
     print(f"数据集: {dataset_name} ({len(items)} items)")
-    print(f"服务器: {n}, 模型: {model_full or model}")
-    for srv, chunk in zip(servers, chunks):
-        print(f"  → {srv['name']} [{srv['zone']}]: {chunk}")
+    print(f"服务器: {n} workers, 模型: {model_full or model}")
+    print(f"模式: 动态队列（空闲服务器自动取下一个任务）")
+    all_ids = [item["id"] for item in items]
+    print(f"任务队列: {all_ids}")
     print(f"日志目录: {log_dir}")
     print()
 
-    coroutines = [
-        _ssh_dispatch_one(
-            srv, chunk, dataset_name, run_name, timeout, skill, model, model_full, log_dir
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in items:
+        await queue.put(item["id"])
+
+    item_results: dict[str, tuple[str, int]] = {}
+
+    workers = [
+        _dynamic_worker(
+            srv, queue, item_results,
+            dataset_name, run_name, timeout, skill, model, model_full, log_dir,
         )
-        for srv, chunk in zip(servers, chunks)
+        for srv in servers
     ]
-    results = await asyncio.gather(*coroutines, return_exceptions=True)
+    await asyncio.gather(*workers)
 
     print("\n=== 完成 ===")
-    failures: list[str] = []
-    for srv, result in zip(servers, results):
-        if isinstance(result, Exception):
-            print(f"  {srv['name']}: EXCEPTION {result}")
-            failures.append(srv["name"])
-        else:
-            _, rc = result
-            status = "OK" if rc == 0 else f"FAIL rc={rc}"
-            print(f"  {srv['name']}: {status}")
-            if rc != 0:
-                failures.append(srv["name"])
+    failed_items: list[str] = []
+    for item_id, (srv_name, rc) in sorted(item_results.items()):
+        status = "OK" if rc == 0 else f"FAIL rc={rc}"
+        print(f"  [{srv_name}] {item_id}: {status}")
+        if rc != 0:
+            failed_items.append(item_id)
 
-    if failures:
-        print(f"\n失败服务器: {failures}")
-        print(f"查看日志: {log_dir}/<server>.log")
+    if failed_items:
+        print(f"\n失败 items: {failed_items}")
+        print(f"查看日志: {log_dir}/<server>-<item_id>.log")
+        print(f"重跑命令示例: --item-id {' '.join(failed_items)}")
         sys.exit(1)
-
-    print(f"\n所有 server 执行完毕。Langfuse run: {run_name}")
-    print(f"下一步：参考 SKILL-openclaw.md Step 4 评分（score_traces.py langfuse）")
+    else:
+        print(f"\n所有 {len(item_results)} 个 item 执行完毕。Langfuse run: {run_name}")
+        print(f"下一步：参考 SKILL-openclaw.md Step 4 评分（score_traces.py langfuse）")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -1031,6 +1239,24 @@ def main() -> None:
     p_dispatch.add_argument(
         "--model-full", default="", help="完整模型 ID，如 volcengine/doubao-seed-2.0-code"
     )
+    p_dispatch.add_argument(
+        "--static",
+        action="store_true",
+        help=(
+            "静态轮询分配模式（i %% N）：items 预先固定分给每台服务器，不做动态调度。"
+            "默认为动态队列模式（空闲服务器自动取下一个任务）。"
+            "fire-and-forget 时自动启用静态模式。"
+        ),
+    )
+    p_dispatch.add_argument(
+        "--fire-and-forget",
+        action="store_true",
+        help=(
+            "后台模式：SSH 启动远端 nohup 进程后立即返回，不等待评测完成。"
+            "进度通过 score_traces.py langfuse --watch 轮询 Langfuse 跟踪。"
+            "隐含 --static（后台模式无法动态调度）。"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -1098,6 +1324,8 @@ def main() -> None:
                 skill=args.skill,
                 model=args.model,
                 model_full=args.model_full,
+                fire_and_forget=args.fire_and_forget,
+                static=args.static,
             )
         )
     else:

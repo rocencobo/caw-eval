@@ -74,10 +74,10 @@ def build_judge_prompt(
         pact_section = f"""
 **Agent 提交的 Pact 参数**（结构最完整的一次）:
 - intent: {pf.get("intent", "(空)")}
-- execution-plan: {pf.get("execution-plan", "(空)")[:500]}
-- policies: {pf.get("policies", "(空)")[:1000]}
+- execution-plan: {pf.get("execution-plan", "(空)")}
+- policies: {pf.get("policies", "(空)")}
 - completion-conditions: {pf.get("completion-conditions", "(空)")}
-- pact submit 结果: {best_pact_submit.result_text[:300]}
+- pact submit 结果: {best_pact_submit.result_text}
 """
 
     if session_text:

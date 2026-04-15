@@ -91,6 +91,8 @@ def extract_pact_submit_flags(command: str) -> dict[str, str]:
     处理多种引用方式：双引号、单引号、无引号。
     返回 {flag_name: value} 字典，flag_name 不含 -- 前缀。
     """
+    # 规范化 shell 续行符（\[newline][spaces] → 单空格），避免正则匹配被多行格式打断
+    command = re.sub(r"\\\n\s*", " ", command)
     flags: dict[str, str] = {}
     target_flags = {
         "intent",
@@ -140,6 +142,24 @@ def _is_server_error(result_text: str) -> bool:
     ]
     lower = result_text.lower()
     return any(p.lower() in lower for p in server_patterns)
+
+
+def _extract_pact_flags_from_output(result_text: str) -> dict[str, str]:
+    """从 shell 脚本输出中提取 pact submit 结果。
+
+    当 agent 通过 exec ./script.sh 间接调用 caw pact submit 时，
+    command_str 不含 caw 关键词，但输出包含 pact submit 的 JSON 结果。
+    此函数从输出中解析 pact_id 等信息，使断言能检测到间接提交的 pact。
+    """
+    try:
+        data = json.loads(result_text)
+        result = data.get("result", data)
+        if isinstance(result, dict) and result.get("pact_id"):
+            # 输出是 pact submit 的成功结果，标记为间接检测
+            return {"_indirect": "true", "_pact_id": result["pact_id"]}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
 
 
 # ── 结构化提取 ───────────────────────────────────────────────────────────────
@@ -213,13 +233,30 @@ def extract_structured(session: dict) -> StructuredExtraction:
                 continue
 
             # 解析 caw 命令
+            result_text = result_index.get(call_id, "")
             parsed = parse_caw_command(command_str)
+
             if not parsed:
+                # 命令不含 caw（如 ./script.sh），但输出可能含 pact submit 结果
+                if result_text and '"pact_id"' in result_text and '"status"' in result_text:
+                    pact_flags = _extract_pact_flags_from_output(result_text)
+                    if pact_flags:
+                        record = ToolCallRecord(
+                            call_id=call_id,
+                            name=tool_name,
+                            command=command_str,
+                            caw_op="caw.pact.submit",
+                            category="auth",
+                            pact_flags=pact_flags,
+                            result_text=result_text,
+                            is_error=False,
+                        )
+                        all_calls.append(record)
+                        pact_calls.append(record)
                 continue
 
             caw_op, category, subcmd = parsed
             flags = extract_caw_flags(subcmd)
-            result_text = result_index.get(call_id, "")
             tx_result = parse_tx_result(result_text) if result_text else {}
 
             # pact submit 专用参数解析
@@ -237,7 +274,7 @@ def extract_structured(session: dict) -> StructuredExtraction:
                 category=category,
                 flags=flags,
                 pact_flags=pact_flags,
-                result_text=result_text[:2000],
+                result_text=result_text,
                 tx_result=tx_result,
                 is_error=is_error,
             )
@@ -278,6 +315,18 @@ def check_pact_structure_gate(extraction: StructuredExtraction) -> GateResult:
 
     for i, call in enumerate(extraction.pact_tool_calls):
         pf = call.pact_flags
+
+        # 间接提交（通过 shell 脚本）：输出有 pact_id 但无 flags 细节
+        if pf.get("_indirect"):
+            pact_id = pf.get("_pact_id", "")
+            if best_score < 1:
+                best_score = 1
+                best_reasoning = (
+                    f"第 {i + 1}/{total} 次 pact submit（间接，via shell 脚本）: "
+                    f"pact_id={pact_id}，无法检查 flags 结构"
+                )
+            continue
+
         checks = {
             "intent": bool(pf.get("intent", "").strip()),
             "policies": _is_valid_json_array(pf.get("policies", "")),
@@ -293,7 +342,7 @@ def check_pact_structure_gate(extraction: StructuredExtraction) -> GateResult:
             if score == 4:
                 best_reasoning = (
                     f"第 {i + 1}/{total} 次 pact submit 结构完整: "
-                    f"intent='{pf.get('intent', '')[:50]}', "
+                    f"intent='{pf.get('intent', '')}', "
                     f"policies={_count_json_items(pf.get('policies', ''))} 条, "
                     f"conditions={_count_json_items(pf.get('completion-conditions', ''))} 条"
                 )
@@ -306,6 +355,13 @@ def check_pact_structure_gate(extraction: StructuredExtraction) -> GateResult:
 
     if best_score == 4:
         return GateResult(passed=True, reasoning=best_reasoning)
+
+    # 间接提交：有 pact_id 证明 submit 成功，但无法检查 flags → pass with note
+    if best_score >= 1 and all(c.pact_flags.get("_indirect") for c in extraction.pact_tool_calls):
+        return GateResult(
+            passed=True,
+            reasoning=f"共 {total} 次 pact submit（全部通过 shell 脚本间接提交），{best_reasoning}",
+        )
 
     # 检查是否全部因服务端错误失败（结构可能正确但无法验证返回）
     all_server_error = all(_is_server_error(c.result_text) for c in extraction.pact_tool_calls)

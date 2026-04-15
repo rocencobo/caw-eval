@@ -17,6 +17,71 @@ Step 1: SSH → run               Step 2: langfuse 评分（直接读 Langfuse A
 
 session 数据通过 Langfuse API 读取，**无需 scp 下载或导入本地**。
 
+**推荐模式（动态队列，阻塞）**：dispatch 不加 `--fire-and-forget`，本地等待所有 item 完成，服务器间动态调度（快台多跑），结束后再评分：
+
+```
+dispatch（默认动态队列）→ 等待所有 item 完成 → score_traces.py langfuse ...
+  （空闲服务器自动取下一个任务）
+```
+
+**流水线模式（可选，边跑边评分）**：dispatch 加 `--fire-and-forget`（静态预分配）+ `--watch` 轮询：
+
+```
+dispatch --fire-and-forget  →  score_traces.py langfuse --watch --dump-judge-requests ...
+  （SSH 立即返回）                （实时轮询，新 trace 出现即生成 judge req）
+```
+
+---
+
+## 新服务器配置清单
+
+新建 openclaw 服务器后，在运行评测前需完成以下配置（否则评测会因依赖缺失而失败）：
+
+```bash
+# 1. SSH 进服务器，切换到 ubuntu 用户
+gcloud compute ssh --zone "$ZONE" "$SERVER" --tunnel-through-iap --project "$PROJECT" \
+  -- "sudo su - ubuntu"
+
+# 2. 安装 pip（系统 python 可能不带）
+sudo apt-get update && sudo apt-get install -y python3-pip
+
+# 3. 安装 Python 依赖（必须 pin langfuse==4.0.6：4.2.0 移除了 Langfuse.api，会报 AttributeError）
+pip3 install --user --break-system-packages python-dotenv "langfuse==4.0.6"
+
+# 4. 配置 .env（Langfuse + caw skill 凭证）
+mkdir -p ~/.agents/skills/caw-eval/scripts/
+# 从本地 Mac 推送（或手动填写）：
+# gcloud compute scp --zone "$ZONE" --project "$PROJECT" \
+#   ~/.agents/skills/caw-eval/scripts/.env \
+#   ubuntu@"$SERVER":~/.agents/skills/caw-eval/scripts/.env --tunnel-through-iap
+
+# 5. 同步评测脚本（若未通过 openclaw skill sync 同步）
+# 检查：ls ~/.agents/skills/caw-eval/scripts/run_eval_openclaw.py
+```
+
+> **langfuse 版本锁定**：必须用 `langfuse==4.0.6`。4.2.0 以上版本移除了 `Langfuse.api` 属性，
+> 会导致 `AttributeError: 'Langfuse' object has no attribute 'api'`。
+> 远端安装时用 `pip3 install --user --break-system-packages "langfuse==4.0.6"`。
+
+---
+
+## SSH ControlMaster 配置（避免每次 gcloud IAP 重新认证）
+
+在 Mac 的 `~/.ssh/config` 添加以下配置，SSH 连接会复用，dispatch 并行 SSH 时无需多次 gcloud 认证：
+
+```
+Host *
+  AddKeysToAgent yes
+  UseKeychain yes
+  IdentityFile ~/.ssh/id_rsa
+  ControlMaster auto
+  ControlPath ~/.ssh/ssh-%C
+  ControlPersist 24h
+  StrictHostKeyChecking no
+```
+
+配置后只需 `gcloud auth login` 一次，后续 SSH 连接通过 ControlMaster 复用已建立的通道。
+
 ---
 
 ## 服务器连接信息
@@ -141,6 +206,10 @@ print(f'merged {len(results)} judge results')
 "
 ```
 
+> **重要**：每条 judge result 必须含 `trace_id` **和** `item_id` 两个字段，否则
+> `score_traces.py` 的 `load_judge_results()` 无法索引，会打印 "Loaded 0 judge result(s)"。
+> subagent 评分 prompt 模板（`judge_cc.py`）已包含这两个字段；如手动合并需确保保留。
+
 ---
 
 ## Step 4: 应用评分到 Langfuse
@@ -202,10 +271,15 @@ cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{run_name}.md
 | 问题 | 解决 |
 |------|------|
 | gcloud ssh 报 Python 错误 | `export CLOUDSDK_PYTHON=/opt/homebrew/bin/python3.11` |
-| SSH 超时 | 增加 Bash 工具 timeout（600000 = 10 分钟），或用 `run_in_background=True` |
+| SSH 超时 | 增加 Bash 工具 timeout（600000 = 10 分钟），或用 `run_in_background=True`。推荐改用 `dispatch --fire-and-forget` 彻底消除 SSH 阻塞 |
 | `openclaw: command not found` | SSH 中确认 PATH 包含 `/home/ubuntu/.npm-global/bin` |
 | Langfuse 凭证缺失 | 检查 `~/.agents/skills/caw-eval/scripts/.env`（服务器）和本地 `.env` |
-| `langfuse` 子命令报 v2 API 不可用 | 已用 `legacy.observations_v1` API，无影响。如仍报错检查 langfuse 包版本 |
+| `AttributeError: 'Langfuse' object has no attribute 'api'` | 服务器 langfuse 版本过新（4.2.0+ 移除了 `.api`）。修复：`pip3 install --user --break-system-packages "langfuse==4.0.6"` |
+| `langfuse` 子命令报 v2 API 不可用 | 已用 `legacy.observations_v1` API，无影响。如仍报错检查 langfuse 包版本（需 4.0.6） |
+| `Loaded 0 judge result(s)` | judge_results.json 每条缺少 `trace_id` 或 `item_id` 字段。重新合并时需从 judge_req.json 补充这两个字段 |
+| `Agent "eval-xxx" already exists` | 上次评测异常退出残留同名 agent。脚本已内置预清理（Step 0），手动修复：`openclaw agents delete eval-xxx --force` |
+| `pip install` 报 PEP 668 错误 | Debian 系统保护，加 `--break-system-packages` 参数即可 |
 | task 超时 | `--timeout 900` 增加单 task 超时 |
 | 部分 item 失败 | 用 `--item-id` 重跑失败项 |
 | Langfuse 拉到的 trace 缺 observations | 确认 `run` 子命令的 upload 步骤未跳过（`--skip-upload` 关掉就行） |
+| dispatch 日志为空但 Langfuse 有 trace | IAP tunnel 有 stdout 缓冲。数据实际已上传；可用 `--fire-and-forget` + nohup 避免此问题 |

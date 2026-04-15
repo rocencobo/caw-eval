@@ -101,7 +101,7 @@ CAW_OP_TABLE = [
 CAW_BIN_PATTERN = re.compile(
     r"(?:^|&&\s*)"
     r"(?:[^\s]*?/)?caw\s+"
-    r"(.*?)(?:\s+&&|\s*$)",
+    r"([\s\S]*?)(?:\s+&&|\s*\Z)",  # [\s\S]*? 匹配含换行的参数（如多行 JSON policies）；\Z 匹配字符串末尾而非行尾
     re.MULTILINE,
 )
 SKILL_INSTALL_PATTERN = re.compile(
@@ -313,6 +313,8 @@ def parse_caw_command(command: str) -> Optional[tuple[str, str, str]]:
 
 
 def extract_caw_flags(subcmd: str) -> dict:
+    # 规范化 shell 续行符（\[newline][spaces] → 单空格）
+    subcmd = re.sub(r"\\\n\s*", " ", subcmd)
     flags = {}
     for flag, key in [
         (r"--to\s+(\S+)", "to_address"),
@@ -362,12 +364,11 @@ def ts_to_ns(ts: Optional[str]) -> Optional[int]:
         return None
 
 
-def safe_str(obj: object, limit: int = 2000) -> str:
+def safe_str(obj: object) -> str:
     try:
-        s = json.dumps(obj, ensure_ascii=False, default=str) if not isinstance(obj, str) else obj
-        return s[:limit]
+        return json.dumps(obj, ensure_ascii=False, default=str) if not isinstance(obj, str) else obj
     except Exception:
-        return str(obj)[:limit]
+        return str(obj)
 
 
 def extract_user_text(msg: dict) -> str:
@@ -725,7 +726,7 @@ class SessionUploader:
                         final_text = b.get("text", "")
 
         input_preview = (
-            user_text_raw[:50].rstrip() + ".." if len(user_text_raw) > 50 else user_text_raw
+            user_text_raw[:200].rstrip() + ".." if len(user_text_raw) > 200 else user_text_raw
         )
         turn_name = f'turn:{idx} ("{input_preview}")' if input_preview else f"turn:{idx}"
 
@@ -857,7 +858,7 @@ class SessionUploader:
             category = name
 
         attrs: dict = {
-            "langfuse.observation.input": safe_str(args, 800),
+            "langfuse.observation.input": safe_str(args),
             "langfuse.observation.output": result_text,
             "langfuse.observation.metadata.tool_call_id": call_id,
             "langfuse.observation.metadata.tool_name": name,
@@ -894,9 +895,11 @@ class SessionUploader:
         exit_code: Optional[int],
     ) -> dict:
         flags = extract_caw_flags(subcmd)
+        # 规范化 shell 续行符（\[newline][spaces] → 单空格），避免 Langfuse 存储时截断多行值
+        subcmd_normalized = re.sub(r"\\\n\s*", " ", subcmd)
 
         attrs: dict = {
-            "langfuse.observation.input": safe_str({"subcmd": subcmd}),
+            "langfuse.observation.input": safe_str({"subcmd": subcmd_normalized}),
             "langfuse.observation.output": result_text,
             "langfuse.observation.metadata.caw_op": span_name,
             "langfuse.observation.metadata.category": category,
