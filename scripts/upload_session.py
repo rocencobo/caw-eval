@@ -68,7 +68,6 @@ CAW_OP_TABLE = [
     (["pact events"], "caw.pact.events", "auth"),
     (["pact list"], "caw.pact.list", "auth"),
     (["pact revoke"], "caw.pact.revoke", "auth"),
-    (["pact withdraw"], "caw.pact.withdraw", "auth"),
     (["pact update-conditions"], "caw.pact.update_conditions", "auth"),
     (["pact update-policies"], "caw.pact.update_policies", "auth"),
     (["approval create"], "caw.approval.create", "auth"),
@@ -638,7 +637,14 @@ class SessionUploader:
                     "uploaded_at": now_iso,
                     "session_started_at": _ns_to_iso(start_ns, now_iso),
                     "session_ended_at": _ns_to_iso(last_ns, now_iso),
-                    **({"duration_ms": duration_ms, "duration_seconds": round(duration_ms / 1000, 1)} if duration_ms is not None else {}),
+                    **(
+                        {
+                            "duration_ms": duration_ms,
+                            "duration_seconds": round(duration_ms / 1000, 1),
+                        }
+                        if duration_ms is not None
+                        else {}
+                    ),
                     "host": f"{getpass.getuser()}@{socket.gethostname()}",
                     **{
                         k: v

@@ -1,7 +1,7 @@
 ---
 name: caw-eval-openclaw
 metadata:
-  version: "2026.04.13.1"
+  version: "2026.04.15.1"
 description: |
   在 Openclaw 服务器上跑 CAW Agent 弱模型评测。
   Use when: 用户说"弱模型评测"、"openclaw 评测"、"弱模型验证"、"caw 弱模型测试"、"模型兼容性测试"。
@@ -25,54 +25,36 @@ description: |
   > "当前在本地，openclaw 弱模型评测 SKILL 不适用。请使用 `caw-eval` skill（说'跑评测'触发 CC 评测）。若确实要跑弱模型验证，请 ssh 到 openclaw 服务器再触发本 SKILL。"
   然后停止。
 
-## Step 1: 生成评测任务
+## Step 1: 运行评测
 
-运行以下命令：
-
-```bash
-cd /home/luochong_cobo_com/skills/caw-eval/scripts
-python3 run_eval_openclaw.py prepare --dataset-name caw-agent-eval-seth-v2
-```
-
-命令会在 `/tmp/eval-prompts/` 下生成文件。读取 `/tmp/eval-prompts/_all_tasks.txt` 的内容。
-
-## Step 2: 并行执行任务（3 个并发，Wrapper 模式）
-
-对 `_all_tasks.txt` 中的每个 Task，提取 ` ```prompt ` 和 ` ``` ` 之间的内容作为 subagent 的 prompt。
-
-**每个 task subagent 是一个 Wrapper**，负责：
-1. 用 `sessions_spawn` 启动真正的 task session
-2. 记录 `childSessionKey`
-3. task 完成后调用 `sessions_history` 导出历史
-4. 将结果写入 `/tmp/eval-sessions/{item_id}.json`
-5. 输出 `WRAPPER DONE: {item_id}` 表示完成
-
-**执行策略：始终保持 3 个 wrapper subagent 并行运行**
-1. 一次启动 3 个 wrapper subagent（分别对应不同的 Task）
-2. 任意一个 wrapper 输出 `WRAPPER DONE:` 后，立即启动下一个未执行的 Task
-3. 直到所有 Task 都启动并完成
-
-**注意：**
-- 不要等所有 3 个都完成再启动下一批，必须"完成一个补一个"
-- 不需要分析结果，不需要上传，只需要所有 wrapper 输出 `WRAPPER DONE:`
-- 每个 wrapper subagent 独立运行，互不干扰
-
-## Step 3: 导入、上传并打包
-
-所有 Wrapper 执行完后，运行：
+脚本自动逐个执行所有 task、收集 session、上传 Langfuse、打包。运行以下命令：
 
 ```bash
 cd /home/luochong_cobo_com/skills/caw-eval/scripts
 
-# 从 openclaw status 读取当前模型（provider/model-name 格式）
+DATASET_NAME=caw-agent-eval-seth-v2
+
+# 从 openclaw status 读取当前模型
 MODEL_FULL=$(openclaw status | awk -F' \| ' 'NR==2{print $3}')
-MODEL_SHORT=$(echo "$MODEL_FULL" | sed 's|.*/||' | cut -d'-' -f1)  # 取模型名首段，如 doubao
+MODEL_SHORT=$(echo "$MODEL_FULL" | sed 's|.*/||' | cut -d'-' -f1)
 RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
 
-# 从 /tmp/eval-sessions/ 导入 wrapper 写入的 session JSON
-python3 run_eval_openclaw.py import-sessions --run-name "$RUN_NAME"
-python3 run_eval_openclaw.py upload --run-name "$RUN_NAME" --model "$MODEL_SHORT" --model-full "$MODEL_FULL"
-python3 run_eval_openclaw.py pack --run-name "$RUN_NAME"
+python3 run_eval_openclaw.py run \
+  --run-name "$RUN_NAME" \
+  --dataset-name "$DATASET_NAME" \
+  --model "$MODEL_SHORT" \
+  --model-full "$MODEL_FULL"
 ```
 
-告诉用户打包文件的路径和下载命令。
+脚本会为每个 task 自动创建隔离 agent → 执行 → 收集 session → 清理 agent，串行逐个执行。
+
+完成后输出打包路径和 **`gcloud compute scp` 下载命令**，将该命令完整地展示给用户，例如：
+
+```
+打包完成: /tmp/eval-oc-<run-name>.tar.gz (X.X MB)
+
+下载到本地（在 Mac 终端执行）：
+  gcloud compute scp <实例名>:/tmp/eval-oc-<run-name>.tar.gz ~/Downloads/ --zone=<zone> --project=<project-id>
+```
+
+把上面的实际输出（含真实实例名、zone、project）原样告诉用户，让用户在 Mac 本地终端执行即可下载。

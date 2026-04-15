@@ -52,7 +52,6 @@ from dotenv import load_dotenv
 
 from assertions import (
     DimensionScore,
-    StructuredExtraction,
     check_pact_structure_gate,
     check_refusal_gate,
     classify_diagnostics,
@@ -62,7 +61,6 @@ from assertions import (
 from judge_cc import (
     JUDGE_SYSTEM_PROMPT,
     build_judge_prompt,
-    extract_json_from_response,
     parse_judge_result_to_scores,
 )
 
@@ -799,11 +797,6 @@ def score_session_file(
         )
 
         # LLM Judge
-        best_pact = get_best_pact_submit(extraction)
-        assertion_lines = [
-            f"[gate] pact_structure_valid={'pass' if pact_gate.passed else 'fail'} — {pact_gate.reasoning}",
-            f"[diag] error_type={diagnostics.error_type}, retry_count={diagnostics.retry_count}",
-        ]
         judge_scores = _get_judge_scores(judge_result=judge_result)
         for s in judge_scores:
             all_dimensions[s.dimension] = s
@@ -927,14 +920,18 @@ def score_session_file(
         return result
 
     # 构建 score metadata（用于 ClickHouse JSONExtract 查询）
+    _dataset_name = item_metadata.get("dataset_name", "")
+    # type: 优先用 item 自带字段，fallback 从 dataset 名称推导（recipe/transfer 等场景类型）
+    _type = item_metadata.get("type", "") or ("recipe" if "recipe" in _dataset_name else "")
     score_meta = {
         "run_name": item_metadata.get("run_name", ""),
-        "dataset_name": item_metadata.get("dataset_name", ""),
+        "dataset_name": _dataset_name,
         "item_id": item_metadata.get("id", ""),
         "operation_type": item_metadata.get("operation_type", ""),
         "difficulty": item_metadata.get("difficulty", ""),
         "chain": item_metadata.get("chain", ""),
         "model": item_metadata.get("model", ""),
+        "type": _type,
     }
     # 去除空值
     score_meta = {k: v for k, v in score_meta.items() if v}
@@ -963,9 +960,7 @@ def score_session_file(
     # 去除 duration/token 的零值（这两个 0 通常是"未采集"而非真实 0）
     # 其他指标（tool_call/caw_cmd/pact/tx/error）保留 0，因为 0 本身是有意义的信号
     run_metrics = {
-        k: v
-        for k, v in run_metrics.items()
-        if v or k not in ("duration_seconds", "token_count")
+        k: v for k, v in run_metrics.items() if v or k not in ("duration_seconds", "token_count")
     }
 
     _lf = lf or _make_langfuse()

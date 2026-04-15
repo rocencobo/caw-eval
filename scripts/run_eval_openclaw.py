@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
 """
-Openclaw 弱模型评测脚本 — 三层分离方案的服务器端。
+Openclaw 弱模型评测脚本。
 
 在 Openclaw 服务器上运行，零 LLM 依赖。负责：
-  1. prepare         — 从 Langfuse 拉 dataset items，生成 task prompt 文件（含 wrapper 模式）
-  2. import-sessions — 从 wrapper subagent 写入的 /tmp/eval-sessions/*.json 导入到 run 目录
-  3. upload          — 将收集的 session 上传到 Langfuse
-  4. pack            — 打包 session 供本地下载
+  1. run             — 脚本驱动串行执行评测（推荐）：自动创建隔离 agent、执行 task、收集 session
+  2. prepare         — 从 Langfuse 拉 dataset items，生成 task prompt 文件
+  3. import-sessions — 从 /tmp/eval-sessions/*.json 导入 session 到 run 目录
+  4. collect         — 从 openclaw session 目录中 grep 收集 session
+  5. upload          — 将收集的 session 上传到 Langfuse
+  6. pack            — 打包 session 供本地下载
 
-执行 caw 命令由 openclaw 对话中的弱模型完成。wrapper subagent 负责
-spawn task、调用 sessions_history、将结果写入 /tmp/eval-sessions/{item_id}.json。
+推荐用法（脚本驱动，串行执行）:
+    python run_eval_openclaw.py run \\
+      --run-name eval-oc-doubao-20260415 \\
+      --dataset-name caw-agent-eval-seth-v2
 
-用法:
-    # Step 1: 生成 prompt（含 wrapper subagent 模式）
+传统用法（wrapper subagent 模式，需弱模型编排）:
     python run_eval_openclaw.py prepare --dataset-name caw-agent-eval-seth-v2
-
-    # Step 2: 在 openclaw 对话中粘贴 _all_tasks.txt，弱模型按 wrapper 模式并行执行
-
-    # Step 3: 导入 session（从 wrapper 写入的 /tmp/eval-sessions/ 读取）
+    # 在 openclaw 对话中粘贴 _all_tasks.txt
     python run_eval_openclaw.py import-sessions --run-name eval-oc-doubao-20260412
-
-    # Step 4: 上传到 Langfuse
     python run_eval_openclaw.py upload --run-name eval-oc-doubao-20260412
-
-    # Step 5: 打包 session 供本地下载评分
     python run_eval_openclaw.py pack --run-name eval-oc-doubao-20260412
 """
 
 import argparse
+import asyncio
 import json
 import shutil
 import socket
@@ -51,6 +48,12 @@ _OC_SESSION_DIR = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
 
 # 评测 run 的本地存储目录
 _RUNS_DIR = Path.home() / ".caw-eval" / "runs"
+
+# ── run 子命令常量 ────────────────────────────────────────────────────────────
+
+_OC_HOME = Path.home() / ".openclaw"
+_DEFAULT_TIMEOUT = 600  # 单个 task 超时（秒）
+_MAX_CONTINUATIONS = 20  # 续传次数上限（安全阀）
 
 
 def build_task_prompt(item: dict) -> str:
@@ -160,6 +163,260 @@ def build_all_tasks_prompt(items: list[dict]) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ── run 子命令（脚本驱动串行执行） ─────────────────────────────────────────────
+
+
+async def _run_openclaw(
+    openclaw_bin: str,
+    args: list[str],
+    timeout: int | None = None,
+) -> tuple[int, str, str]:
+    """调用 openclaw CLI，返回 (returncode, stdout, stderr)。超时时 kill 进程。"""
+    proc = await asyncio.create_subprocess_exec(
+        openclaw_bin,
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, "", "timeout"
+
+    return (
+        proc.returncode or 0,
+        stdout_bytes.decode("utf-8", errors="replace"),
+        stderr_bytes.decode("utf-8", errors="replace"),
+    )
+
+
+def _parse_agent_result(stdout: str) -> dict:
+    """从 ``openclaw agent --json`` 的 stdout 中解析 JSON 结果。
+
+    openclaw 可能在 JSON 前输出非 JSON 文本（如 streaming），因此先尝试全文解析，
+    失败则逐行倒序查找首个合法 JSON 对象。
+    """
+    stdout = stdout.strip()
+    if not stdout:
+        return {}
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {}
+
+
+def _get_stop_reason(result: dict) -> str:
+    """从 openclaw agent --json 的结果中提取 stopReason。"""
+    try:
+        return result["result"]["meta"]["stopReason"]
+    except (KeyError, TypeError):
+        return ""
+
+
+async def _run_single_task(
+    item: dict,
+    openclaw_bin: str,
+    workspace: str,
+    run_dir: Path,
+    timeout: int,
+) -> str:
+    """执行单个评测 task，返回状态字符串 ("ok" | "error:<reason>")。"""
+    item_id = item["id"]
+    agent_name = f"eval-{item_id}"
+    actual_agent_id = ""
+
+    try:
+        # 1. 创建隔离 agent
+        rc, out, err = await _run_openclaw(
+            openclaw_bin,
+            ["agents", "add", agent_name, "--workspace", workspace, "--non-interactive", "--json"],
+            timeout=30,
+        )
+        if rc != 0:
+            print(f"  [{item_id}] ERROR  agents add 失败: {err.strip() or out.strip()}")
+            return "error:agent_create_failed"
+
+        # Openclaw 自动将 agent ID 转小写，从返回的 JSON 中读取实际 ID
+        try:
+            add_result = json.loads(out.strip())
+            actual_agent_id = add_result.get("agentId", agent_name.lower())
+        except json.JSONDecodeError:
+            actual_agent_id = agent_name.lower()
+
+        # 2. 构建 prompt 并发送
+        prompt = build_task_prompt(item)
+        rc, out, err = await _run_openclaw(
+            openclaw_bin,
+            ["agent", "--agent", actual_agent_id, "--message", prompt, "--json", "--timeout", str(timeout)],
+            timeout=timeout + 60,  # 给 CLI 本身留出余量
+        )
+
+        if rc == -1:
+            print(f"  [{item_id}] TIMEOUT  ({timeout}s)")
+            status = "error:timeout"
+        elif rc != 0:
+            print(f"  [{item_id}] ERROR  agent 返回非零: rc={rc}")
+            status = "error:agent_failed"
+        else:
+            result = _parse_agent_result(out)
+            stop_reason = _get_stop_reason(result)
+            status = "ok"
+
+            # 3. 续传循环：stopReason 不是 stop 时发 "继续"
+            continuations = 0
+            while stop_reason and stop_reason != "stop" and continuations < _MAX_CONTINUATIONS:
+                continuations += 1
+                print(f"  [{item_id}] 续传 #{continuations} (stopReason={stop_reason})")
+                rc, out, err = await _run_openclaw(
+                    openclaw_bin,
+                    ["agent", "--agent", actual_agent_id, "--message", "继续执行，不要停下", "--json", "--timeout", str(timeout)],
+                    timeout=timeout + 60,
+                )
+                if rc == -1:
+                    print(f"  [{item_id}] TIMEOUT  续传 #{continuations}")
+                    status = "error:timeout"
+                    break
+                if rc != 0:
+                    print(f"  [{item_id}] ERROR  续传 #{continuations} rc={rc}")
+                    status = "error:agent_failed"
+                    break
+                result = _parse_agent_result(out)
+                stop_reason = _get_stop_reason(result)
+
+            if continuations >= _MAX_CONTINUATIONS and stop_reason != "stop":
+                print(f"  [{item_id}] WARN  达到续传上限 ({_MAX_CONTINUATIONS})")
+                status = "warn:max_continuations"
+
+        # 4. 收集 session 文件
+        session_dir = _OC_HOME / "agents" / actual_agent_id / "sessions"
+        jsonl_files = sorted(session_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True) if session_dir.exists() else []
+        # 过滤掉 sessions.json（不是 session 数据文件）
+        jsonl_files = [f for f in jsonl_files if f.name != "sessions.json"]
+
+        if jsonl_files:
+            dst = run_dir / f"{item_id}.jsonl"
+            shutil.copy2(jsonl_files[0], dst)
+            size_kb = dst.stat().st_size / 1024
+            print(f"  [{item_id}] {status.upper()}  session={size_kb:.0f}KB -> {dst.name}")
+        else:
+            print(f"  [{item_id}] {status.upper()}  (no session file)")
+            if status == "ok":
+                status = "error:no_session"
+
+        return status
+
+    except Exception as e:
+        print(f"  [{item_id}] EXCEPTION  {e}")
+        return f"error:exception:{e}"
+
+    finally:
+        # 5. 清理 agent（无论成功失败都执行）
+        if actual_agent_id:
+            rc, _, err = await _run_openclaw(
+                openclaw_bin,
+                ["agents", "delete", actual_agent_id, "--force"],
+                timeout=30,
+            )
+            if rc != 0:
+                print(f"  [{item_id}] WARN  agent 清理失败: {err.strip()}")
+
+
+async def _cmd_run(
+    dataset_name: str,
+    run_name: str,
+    item_ids: list[str] | None,
+    timeout: int,
+    openclaw_bin: str,
+    workspace: str,
+    skip_upload: bool,
+    skip_pack: bool,
+    skill: str,
+    model: str,
+    model_full: str,
+    description: str,
+) -> None:
+    """脚本驱动串行执行评测：为每个 task 创建隔离 agent，通过 CLI 执行，收集 session。"""
+    items = get_dataset_items(dataset_name)
+    if item_ids:
+        items = [i for i in items if i["id"] in item_ids]
+
+    if not items:
+        print("[ERROR] 没有匹配的 items")
+        sys.exit(1)
+
+    run_dir = _RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== 脚本驱动评测 (run: {run_name}) ===")
+    print(f"数据集: {dataset_name} ({len(items)} items)")
+    print(f"openclaw: {openclaw_bin}")
+    print(f"workspace: {workspace}")
+    print(f"timeout: {timeout}s / task")
+    print()
+
+    results: dict[str, str] = {}
+
+    for i, item in enumerate(items):
+        item_id = item["id"]
+        op = item["operation_type"]
+        diff = item["difficulty"]
+        print(f"[{i + 1}/{len(items)}] {item_id} ({op} {diff})")
+        status = await _run_single_task(item, openclaw_bin, workspace, run_dir, timeout)
+        results[item_id] = status
+
+    # 写 manifest
+    manifest = {
+        "run_name": run_name,
+        "dataset_name": dataset_name,
+        "source": "openclaw-cli",
+        "executed_at": datetime.now(tz=timezone.utc).isoformat(),
+        "items": {
+            item["id"]: {
+                "status": results.get(item["id"], "skipped"),
+                "operation_type": item["operation_type"],
+                "difficulty": item["difficulty"],
+            }
+            for item in items
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # 汇总
+    ok_count = sum(1 for s in results.values() if s == "ok")
+    warn_count = sum(1 for s in results.values() if s.startswith("warn:"))
+    err_count = sum(1 for s in results.values() if s.startswith("error:"))
+    print(f"\n=== 完成: {ok_count} ok / {warn_count} warn / {err_count} error (共 {len(items)}) ===")
+    print(f"文件位置: {run_dir}")
+
+    if err_count > 0:
+        failed = [iid for iid, s in results.items() if s.startswith("error:")]
+        print(f"\n失败项: {', '.join(failed)}")
+        print(f"重跑命令: python {sys.argv[0]} run --run-name {run_name} --item-id {' '.join(failed)}")
+
+    # upload + pack
+    if not skip_upload:
+        print("\n--- 上传到 Langfuse ---")
+        cmd_upload(run_name, dataset_name, item_ids, skill, model, model_full, description)
+
+    if not skip_pack:
+        print("\n--- 打包 ---")
+        cmd_pack(run_name)
 
 
 # ── prepare 子命令 ──────────────────────────────────────────────────────────────
@@ -309,9 +566,7 @@ def cmd_import_sessions(
         },
     }
     manifest_path = run_dir / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ── collect 子命令 ─────────────────────────────────────────────────────────────
@@ -391,9 +646,7 @@ def cmd_collect(
         },
     }
     manifest_path = run_dir / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ── upload 子命令 ──────────────────────────────────────────────────────────────
@@ -486,6 +739,25 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd")
 
+    # ── run（推荐）
+    p_run = sub.add_parser("run", help="脚本驱动串行执行评测（推荐）")
+    p_run.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
+    p_run.add_argument("--run-name", required=True)
+    p_run.add_argument("--item-id", nargs="*", help="只执行指定 item")
+    p_run.add_argument("--timeout", type=int, default=_DEFAULT_TIMEOUT, help="单个 task 超时秒数")
+    p_run.add_argument("--openclaw-bin", default="openclaw", help="openclaw 二进制路径")
+    p_run.add_argument(
+        "--workspace",
+        default=str(_OC_HOME / "workspace"),
+        help="Openclaw workspace 路径（默认 ~/.openclaw/workspace）",
+    )
+    p_run.add_argument("--skip-upload", action="store_true", help="跳过上传 Langfuse")
+    p_run.add_argument("--skip-pack", action="store_true", help="跳过打包")
+    p_run.add_argument("--skill", default="cobo-agentic-wallet-sandbox")
+    p_run.add_argument("--model", default="doubao", help="模型短标识")
+    p_run.add_argument("--model-full", default="", help="完整模型 ID")
+    p_run.add_argument("--description", default="", help="自定义 run description")
+
     # ── prepare
     p_prepare = sub.add_parser("prepare", help="生成 task prompt 文件")
     p_prepare.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
@@ -493,18 +765,20 @@ def main() -> None:
     p_prepare.add_argument("--item-id", nargs="*", help="只生成指定 item")
 
     # ── import-sessions
-    p_import = sub.add_parser("import-sessions", help="从 wrapper subagent 导出的 JSON 导入 session")
+    p_import = sub.add_parser(
+        "import-sessions", help="从 wrapper subagent 导出的 JSON 导入 session"
+    )
     p_import.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
     p_import.add_argument("--run-name", required=True)
     p_import.add_argument("--item-id", nargs="*", help="只导入指定 item")
-    p_import.add_argument(
-        "--export-dir", help="wrapper 写入目录（默认 /tmp/eval-sessions）"
-    )
+    p_import.add_argument("--export-dir", help="wrapper 写入目录（默认 /tmp/eval-sessions）")
 
     # ── collect
     p_collect = sub.add_parser("collect", help="收集 openclaw session 文件")
     p_collect.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
-    p_collect.add_argument("--model", default="ark-code", help="模型短标识，用于构建 run name（如 ark-code）")
+    p_collect.add_argument(
+        "--model", default="ark-code", help="模型短标识，用于构建 run name（如 ark-code）"
+    )
     p_collect.add_argument("--run-name", default="", help="run 名称（默认 eval-oc-<model>-<ts>）")
     p_collect.add_argument("--item-id", nargs="*", help="只收集指定 item")
     p_collect.add_argument("--session-dir", help="自定义 session 搜索目录")
@@ -519,7 +793,9 @@ def main() -> None:
     p_upload.add_argument(
         "--model-full", default="ark-code-latest", help="完整模型 ID，写入 run description"
     )
-    p_upload.add_argument("--description", default="", help="自定义 run description（覆盖自动生成）")
+    p_upload.add_argument(
+        "--description", default="", help="自定义 run description（覆盖自动生成）"
+    )
 
     # ── pack
     p_pack = sub.add_parser("pack", help="打包 session 文件供下载")
@@ -527,7 +803,24 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.cmd == "prepare":
+    if args.cmd == "run":
+        asyncio.run(
+            _cmd_run(
+                dataset_name=args.dataset_name,
+                run_name=args.run_name,
+                item_ids=args.item_id,
+                timeout=args.timeout,
+                openclaw_bin=args.openclaw_bin,
+                workspace=args.workspace,
+                skip_upload=args.skip_upload,
+                skip_pack=args.skip_pack,
+                skill=args.skill,
+                model=args.model,
+                model_full=args.model_full,
+                description=args.description,
+            )
+        )
+    elif args.cmd == "prepare":
         cmd_prepare(
             dataset_name=args.dataset_name,
             output_dir=args.output_dir,

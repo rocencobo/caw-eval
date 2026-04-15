@@ -32,7 +32,8 @@ description: |
 
 | 用户说 | 评测方式 | 读取并执行 |
 |--------|---------|-----------|
-| "跑评测"、"测评 CAW"、"eval"、"评分"、"claude code 评测" | **Claude Code 评测** | → 读 [run-eval-cc.md](./references/run-eval-cc.md) 按步骤执行 |
+| "跑评测"、"测评 CAW"、"eval"、"评分"、"claude code 评测" | **Claude Code 评测**（默认 dataset: `caw-agent-eval-seth-v2`） | → 读 [run-eval-cc.md](./references/run-eval-cc.md) 按步骤执行 |
+| "recipe 评测"、"跑 recipe"、"recipe eval" | **Claude Code 评测**（dataset: `caw-recipe-eval-seth-v1`） | → 读 [run-eval-cc.md](./references/run-eval-cc.md) 按步骤执行，`--dataset-name caw-recipe-eval-seth-v1` |
 | "弱模型验证"、"openclaw 评测"、"模型兼容性" | **Openclaw 弱模型验证** | 本 SKILL 不直接执行。告诉用户按 [run-eval-openclaw.md](./references/run-eval-openclaw.md) 操作：在服务器 openclaw 中说"跑评测"→ 下载 session 到本地 → 在本地 Claude Code 说"导入 session 并评分" |
 
 **默认走 Claude Code 评测**（如果用户没有明确说"弱模型"或"openclaw"）。
@@ -85,9 +86,14 @@ process_quality = S1(意图) × 0.15 + S2(Pact) × 0.45 + S3(执行) × 0.4
 
 ## 数据集
 
-默认：`caw-agent-eval-seth-v2`（14 case，Ethereum Sepolia 测试链）
+| 数据集 | Case 数 | 场景类型 | 说明 |
+|--------|---------|---------|------|
+| `caw-agent-eval-seth-v2` | 14 | transfer/swap/lend/dca/... | 默认，Ethereum Sepolia 测试链 |
+| `caw-recipe-eval-seth-v1` | - | recipe | Recipe 多步骤场景，Sepolia 测试链 |
 
-可通过 `--dataset-name` 指定其他数据集。已有数据集和创建新数据集参见 [dataset-management.md](./references/dataset-management.md)。
+- 默认使用 `caw-agent-eval-seth-v2`，用户明确说"recipe 评测"时改用 `caw-recipe-eval-seth-v1`
+- 可通过 `--dataset-name` 指定其他数据集
+- 已有数据集和创建新数据集参见 [dataset-management.md](./references/dataset-management.md)
 
 ## Scripts
 

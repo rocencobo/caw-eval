@@ -2,18 +2,23 @@
 
 ## 概述
 
-在 Openclaw 服务器上用弱模型验证 CAW Skill 的兼容性。三层分离架构：
+在 Openclaw 服务器上用弱模型验证 CAW Skill 的兼容性。脚本驱动架构：
 
 ```
-服务器 Openclaw（弱模型）           本地 Claude Code（Sonnet）
-┌─────────────────────────┐       ┌─────────────────────────┐
-│ 弱模型读 SKILL-openclaw │       │                         │
-│   Step 1: prepare       │       │ 导入 session            │
-│   Step 2: 逐个 task     │       │ LLM Judge 评分          │
-│   Step 3: collect + pack│       │ 上传 Langfuse           │
-└─────────────────────────┘       │ 生成报告                │
-         ↓ gcloud scp             └─────────────────────────┘
+服务器（Python 脚本编排）               本地 Claude Code（Sonnet）
+┌───────────────────────────┐       ┌─────────────────────────┐
+│ python run_eval_openclaw  │       │                         │
+│   .py run                 │       │ 导入 session            │
+│                           │       │ LLM Judge 评分          │
+│ 串行执行每个 task:         │       │ 上传 Langfuse           │
+│   agents add → agent CLI  │       │ 生成报告                │
+│   → collect → delete      │       │                         │
+│   → upload → pack         │       │                         │
+└───────────────────────────┘       └─────────────────────────┘
+         ↓ gcloud scp
 ```
+
+脚本通过 `openclaw agent` CLI 驱动弱模型逐个执行评测 task，弱模型不参与编排。
 
 ---
 
@@ -35,14 +40,7 @@ caw wallet balance  # SETH >= 0.2
 # 3. cobo-agentic-wallet-sandbox skill 已安装
 npx skills add cobosteven/cobo-agent-wallet-manual --skill cobo-agentic-wallet-sandbox --yes --global
 
-# 4. caw-eval-openclaw skill 已安装
-# 方式 A：从远程安装
-npx skills add cobosteven/cobo-agent-wallet-manual --skill caw-eval-openclaw --yes --global
-# 方式 B：手动复制（开发阶段）
-mkdir -p ~/.openclaw/skills/caw-eval-openclaw
-cp SKILL-openclaw.md ~/.openclaw/skills/caw-eval-openclaw/SKILL.md
-
-# 5. 评测脚本已部署到服务器
+# 4. 评测脚本已部署到服务器
 # 需要以下文件：
 #   run_eval_openclaw.py
 #   eval_utils.py
@@ -50,8 +48,11 @@ cp SKILL-openclaw.md ~/.openclaw/skills/caw-eval-openclaw/SKILL.md
 #   .env（含 Langfuse 凭证）
 # 放到统一目录，如 /home/luochong_cobo_com/skills/caw-eval/scripts/
 
-# 6. Python 依赖
+# 5. Python 依赖
 pip install langfuse python-dotenv
+
+# 6. openclaw CLI 在 PATH 中
+which openclaw  # 应输出路径，如 /home/ubuntu/.npm-global/bin/openclaw
 ```
 
 ### 本地环境
@@ -62,26 +63,38 @@ pip install langfuse python-dotenv
 
 ## 操作流程
 
-### 第一步：在 Openclaw 中跑评测
+### 第一步：在服务器上跑评测
 
-在服务器上打开 openclaw 对话，输入：
+在服务器终端运行（不需要通过 openclaw 对话）：
 
+```bash
+cd /home/luochong_cobo_com/skills/caw-eval/scripts
+
+DATASET_NAME=caw-agent-eval-seth-v2
+MODEL_FULL=$(openclaw status | awk -F' | ' 'NR==2{print $3}')
+MODEL_SHORT=$(echo "$MODEL_FULL" | sed 's|.*/||' | cut -d'-' -f1)
+RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
+
+python3 run_eval_openclaw.py run \
+  --run-name "$RUN_NAME" \
+  --dataset-name "$DATASET_NAME" \
+  --model "$MODEL_SHORT" \
+  --model-full "$MODEL_FULL"
 ```
-跑评测
-```
 
-弱模型读 `caw-eval-openclaw` skill 后，自动执行：
-1. 运行 `prepare` 生成所有 task prompt
-2. 并行调 `task subagent` 执行 14 个 case（保持 3 个并发）
-3. 运行 `collect` + `upload` + `pack` 收集、上传并打包 session
+脚本自动执行：
+1. 从 Langfuse 拉取 dataset items
+2. 对每个 item 串行执行：创建隔离 agent → 通过 `openclaw agent` CLI 发送 task → 收集 session → 删除 agent
+3. 上传 session 到 Langfuse
+4. 打包 session 文件并输出下载命令
 
 完成后会输出打包文件路径和下载命令。
 
-> **如果弱模型不理解**：改为手动操作——在服务器终端运行 `python3 run_eval_openclaw.py prepare`，然后把 `_all_tasks.txt` 内容粘贴到 openclaw 对话中。
+> **部分 item 失败时**：脚本会输出失败项列表和重跑命令，用 `--item-id` 参数只重跑失败项。
 
 ### 第二步：下载到本地
 
-在 Mac 终端执行 Openclaw 给出的下载命令：
+在 Mac 终端执行脚本给出的下载命令：
 
 ```bash
 gcloud compute scp <实例名>:/tmp/eval-oc-*.tar.gz ~/Downloads/ \
@@ -120,9 +133,11 @@ Claude Code 自动执行：import-sessions → LLM Judge 评分 → 上传 Langf
 
 | 脚本 | 子命令 | 说明 |
 |------|--------|------|
-| `run_eval_openclaw.py` | `prepare` | 从 Langfuse 拉 items，生成 task prompt + 汇总 _all_tasks.txt |
+| `run_eval_openclaw.py` | `run` | **推荐**。脚本驱动串行执行：为每个 task 创建隔离 agent、通过 CLI 执行、收集 session、清理 agent |
+| | `prepare` | 从 Langfuse 拉 items，生成 task prompt 文件（传统 wrapper 模式用） |
+| | `import-sessions` | 从 /tmp/eval-sessions/ 导入 wrapper 写入的 session JSON |
 | | `collect` | 在 openclaw session 目录中 grep 搜索 eval 标记，收集到统一目录 |
-| | `upload` | 上传 session 到 Langfuse（可选，也可在本地上传） |
+| | `upload` | 上传 session 到 Langfuse |
 | | `pack` | 打包 session 目录为 tar.gz，输出下载命令 |
 | `eval_utils.py` | — | 公共工具（Langfuse 客户端/数据集操作/上传函数） |
 | `upload_session.py` | — | session.jsonl → Langfuse trace |
@@ -133,9 +148,11 @@ Claude Code 自动执行：import-sessions → LLM Judge 评分 → 上传 Langf
 
 | 问题 | 解决 |
 |------|------|
-| openclaw 说"不理解跑评测" | 确认 caw-eval-openclaw skill 已安装（openclaw 中输入 `/skills` 查看） |
-| 弱模型跑到一半停了 | 正常，弱模型能力有限。输入"继续执行剩余 task"或手动在终端跑 collect |
-| collect 找不到 session | 确认 task 已完成，检查 `~/.openclaw/agents/main/sessions/` 下是否有文件 |
+| `openclaw: command not found` | 确认 openclaw 在 PATH 中（`export PATH=/home/ubuntu/.npm-global/bin:$PATH`）|
+| `run` 子命令 agents add 失败 | 检查 `openclaw agents list`，确认没有同名 agent 残留；手动 `openclaw agents delete eval-xxx --force` 清理 |
+| task 超时 | 默认 600 秒，DeFi 操作可能更久，用 `--timeout 900` 增加超时 |
+| session 文件格式不对 | `run` 子命令直接收集 otel JSONL，无需转换；如果用传统 `collect` 模式，确认文件名以 `E2E-` 开头 |
 | prepare 报 "Langfuse credentials not set" | 检查 `.env` 文件是否存在且凭证正确 |
 | gcloud scp 报错 | 确认 zone/project-id 正确（在服务器上查 metadata） |
 | 本地导入后评分报错 | 确认 session 文件是 `.jsonl` 格式，文件名以 `E2E-` 开头 |
+| 部分 task 失败需要重跑 | 用 `--item-id E2E-01L1 E2E-02L1` 只重跑指定 item，run 目录会累积结果 |

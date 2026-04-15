@@ -194,7 +194,9 @@ def batch_upload_sessions(
             print(f"    [INFO] trace_id: {result_trace_id}")
             langfuse_item_id = meta_to_langfuse.get(item_id)
             if langfuse_item_id:
-                link_to_dataset_run(lf, langfuse_item_id, run_name, result_trace_id, run_description)
+                link_to_dataset_run(
+                    lf, langfuse_item_id, run_name, result_trace_id, run_description
+                )
             else:
                 print(f"    [WARN] Dataset item not found for {item_id}, skipping link")
         else:

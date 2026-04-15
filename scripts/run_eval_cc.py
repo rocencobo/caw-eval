@@ -25,6 +25,7 @@ Claude Code 评测编排脚本 — 替代 openclaw 的评测流程。
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -320,6 +321,192 @@ def cmd_import_sessions(
     print(f"  python run_eval_cc.py score --run-name {run_name} --report")
 
 
+# ── metrics 子命令 ────────────────────────────────────────────────────────────
+
+
+def _extract_session_metrics(jsonl_path: Path) -> dict:
+    """从单个 session JSONL 文件提取运行指标。
+
+    返回字段：
+      duration_secs, tokens, tool_calls, caw_cmds, pact_submits, tx_cmds, errors
+    """
+    lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+    timestamps: list[str] = []
+    total_tokens = 0
+    tool_call_count = 0
+
+    # caw 命令记录：{id, command, is_pact_submit, is_tx}
+    caw_records: list[dict] = []
+
+    # tool_result 索引：tool_use_id -> result_text
+    result_index: dict[str, str] = {}
+
+    for raw in lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        ts = ev.get("timestamp", "")
+        if ts:
+            timestamps.append(ts)
+
+        ev_type = ev.get("type", "")
+        msg = ev.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+
+        if ev_type == "user":
+            # 收集 tool_result
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_result" and block.get("tool_use_id"):
+                    raw_content = block.get("content", "")
+                    if isinstance(raw_content, list):
+                        text = "\n".join(
+                            b.get("text", "") for b in raw_content if isinstance(b, dict)
+                        )
+                    else:
+                        text = str(raw_content)
+                    result_index[block["tool_use_id"]] = text
+
+        elif ev_type == "assistant":
+            # 累计 tokens：output_tokens（模型生成量，不受 cache 影响，最能反映实际工作量）
+            usage = msg.get("usage", {})
+            total_tokens += usage.get("output_tokens", 0)
+
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") != "tool_use":
+                    continue
+                tool_call_count += 1
+                if block.get("name") != "Bash":
+                    continue
+                inp = block.get("input", {})
+                cmd = inp.get("command", "") if isinstance(inp, dict) else ""
+                # 只统计实际 caw 命令（排除 PATH export 等前缀）
+                if not re.search(r"\bcaw\s+\w", cmd):
+                    continue
+                caw_records.append(
+                    {
+                        "id": block.get("id", ""),
+                        "command": cmd,
+                        "is_pact_submit": bool(re.search(r"\bcaw\s+pact\s+submit\b", cmd)),
+                        "is_tx": bool(re.search(r"\bcaw\s+tx\b", cmd)),
+                    }
+                )
+
+    # 时长
+    duration_secs = 0
+    if len(timestamps) >= 2:
+        t0 = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+        t1 = datetime.fromisoformat(timestamps[-1].replace("Z", "+00:00"))
+        duration_secs = int((t1 - t0).total_seconds())
+
+    # 错误数：caw 命令返回 error_code 或 "error": true
+    error_count = 0
+    for rec in caw_records:
+        result = result_index.get(rec["id"], "")
+        is_error = False
+        try:
+            data = json.loads(result)
+            inner = data.get("result", data)
+            is_error = bool(inner.get("error_code")) or bool(data.get("error"))
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            pass
+        if not is_error:
+            lower = result.lower()
+            is_error = '"error": true' in lower or '"error_code"' in lower
+        if is_error:
+            error_count += 1
+
+    mins, secs = divmod(duration_secs, 60)
+    return {
+        "duration_secs": duration_secs,
+        "duration_str": f"{mins}:{secs:02d}",
+        "tokens": total_tokens,
+        "tool_calls": tool_call_count,
+        "caw_cmds": len(caw_records),
+        "pact_submits": sum(1 for r in caw_records if r["is_pact_submit"]),
+        "tx_cmds": sum(1 for r in caw_records if r["is_tx"]),
+        "errors": error_count,
+    }
+
+
+def cmd_metrics(run_name: str) -> None:
+    """从 run 目录的 session 文件提取运行指标，写入 session_metrics.json。"""
+    run_dir = _RUNS_DIR / run_name
+    if not run_dir.exists():
+        print(f"[ERROR] run 目录不存在: {run_dir}")
+        sys.exit(1)
+
+    session_files = sorted(run_dir.glob("E2E-*.jsonl"))
+    if not session_files:
+        print(f"[ERROR] 没有找到 session 文件: {run_dir}")
+        sys.exit(1)
+
+    print(f"=== 提取运行指标 ({len(session_files)} 个 session) ===\n")
+
+    items: list[dict] = []
+    for sf in session_files:
+        m = _extract_session_metrics(sf)
+        m["item_id"] = sf.stem
+        items.append(m)
+        print(
+            f"  [{sf.stem}]  {m['duration_str']:>6s}  "
+            f"tokens={m['tokens']:>7,}  tool={m['tool_calls']:>3}  "
+            f"caw={m['caw_cmds']:>3}  pact_sub={m['pact_submits']}  "
+            f"tx={m['tx_cmds']}  err={m['errors']}"
+        )
+
+    # 合计 / 平均
+    def _sum(key: str) -> int:
+        return sum(it[key] for it in items)
+
+    n = len(items)
+    totals = {
+        "duration_secs": _sum("duration_secs"),
+        "tokens": _sum("tokens"),
+        "tool_calls": _sum("tool_calls"),
+        "caw_cmds": _sum("caw_cmds"),
+        "pact_submits": _sum("pact_submits"),
+        "tx_cmds": _sum("tx_cmds"),
+        "errors": _sum("errors"),
+    }
+    tm, ts_ = divmod(totals["duration_secs"], 60)
+    totals["duration_str"] = f"{tm}:{ts_:02d}"
+
+    averages = {k: round(v / n, 1) for k, v in totals.items() if k not in ("duration_str",)}
+    am, as_ = divmod(int(averages["duration_secs"]), 60)
+    averages["duration_str"] = f"{am}:{as_:02d}"
+
+    def _fmt(d: dict) -> str:
+        return (
+            f"{d['duration_str']}  tokens={d['tokens']:,}  tool={d['tool_calls']}"
+            f"  caw={d['caw_cmds']}  pact_sub={d['pact_submits']}"
+            f"  tx={d['tx_cmds']}  err={d['errors']}"
+        )
+
+    print(f"\n  合计: {_fmt(totals)}")
+    print(f"  平均: {_fmt(averages)}")
+
+    output = {
+        "run_name": run_name,
+        "extracted_at": datetime.now(tz=timezone.utc).isoformat(),
+        "items": items,
+        "totals": totals,
+        "averages": averages,
+    }
+    out_path = run_dir / "session_metrics.json"
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False))
+    print(f"\n已写入: {out_path}")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
@@ -351,9 +538,15 @@ def main() -> None:
     p_upload.add_argument("--dataset-name", default="caw-agent-eval-seth-v2")
     p_upload.add_argument("--item-id", nargs="*", help="只上传指定 item")
     p_upload.add_argument("--skill", default="cobo-agentic-wallet-dev")
-    p_upload.add_argument("--model", default="sonnet", help="模型短标识，用于 run description（如 sonnet）")
-    p_upload.add_argument("--model-full", default="claude-sonnet-4-6", help="完整模型 ID，写入 run description")
-    p_upload.add_argument("--description", default="", help="自定义 run description（覆盖自动生成）")
+    p_upload.add_argument(
+        "--model", default="sonnet", help="模型短标识，用于 run description（如 sonnet）"
+    )
+    p_upload.add_argument(
+        "--model-full", default="claude-sonnet-4-6", help="完整模型 ID，写入 run description"
+    )
+    p_upload.add_argument(
+        "--description", default="", help="自定义 run description（覆盖自动生成）"
+    )
 
     # ── score ─────────────────────────────────────────────────────────────────
     p_score = sub.add_parser("score", help="对 session 评分")
@@ -369,6 +562,12 @@ def main() -> None:
         "--from", dest="from_dir", required=True, help="源目录（如 /tmp/oc-sessions/）"
     )
     p_import.add_argument("--run-name", required=True, help="导入到的 run 名称")
+
+    # ── metrics ───────────────────────────────────────────────────────────────
+    p_metrics = sub.add_parser(
+        "metrics", help="从 session 文件提取运行指标（时长/tokens/caw命令等）"
+    )
+    p_metrics.add_argument("--run-name", required=True)
 
     args = parser.parse_args()
 
@@ -407,6 +606,8 @@ def main() -> None:
             from_dir=args.from_dir,
             run_name=args.run_name,
         )
+    elif args.cmd == "metrics":
+        cmd_metrics(run_name=args.run_name)
     else:
         parser.print_help()
         sys.exit(1)
