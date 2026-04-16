@@ -673,7 +673,7 @@ class SessionUploader:
         # 上传 duration 为 Langfuse Score（数值指标，可在 Dashboard 跨 run 对比）
         if duration_ms is not None:
             try:
-                lf.score(
+                lf.create_score(
                     trace_id=sid,
                     name="duration_seconds",
                     value=round(duration_ms / 1000, 1),

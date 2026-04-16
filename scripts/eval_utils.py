@@ -20,8 +20,10 @@ from langfuse import Langfuse
 
 from upload_session import upload_session_file
 
-# 自动加载同目录下的 .env（不覆盖已设置的环境变量）
+# 自动加载 .env（不覆盖已设置的环境变量）
+# 优先级：同目录 .env > ~/.caw-eval/.env（备用，skill sync 不会清除）
 load_dotenv(Path(__file__).parent / ".env", override=False)
+load_dotenv(Path.home() / ".caw-eval" / ".env", override=False)
 
 _DEFAULT_HOST = "https://langfuse.1cobo.com"
 

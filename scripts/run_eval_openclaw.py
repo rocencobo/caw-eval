@@ -295,7 +295,9 @@ async def _run_single_task(
 ) -> str:
     """执行单个评测 task，返回状态字符串 ("ok" | "error:<reason>")。"""
     item_id = item["id"]
-    agent_name = f"eval-{item_id}"
+    # 在 agent 名中加入完整 run_name，确保不同 run 使用不同的
+    # ~/.openclaw/agents/ 目录，从根本上避免继承上一次 run 的旧 session。
+    agent_name = f"eval-{item_id}-{run_dir.name}"
     actual_agent_id = ""
 
     try:
@@ -306,9 +308,9 @@ async def _run_single_task(
             ["agents", "delete", agent_name.lower(), "--force"],
             timeout=15,
         )
-        # openclaw agents delete 只删注册信息，不删 session 文件目录。
-        # 如果不清理，agents add 重建同名 agent 时会继承旧 session（包括上次
-        # 卡住的 pending 交易上下文），导致本次评测从错误状态续跑。
+        # 同时清理 session 目录（agents delete 只删注册信息，不删目录）。
+        # 由于 agent 名已含 run_suffix，理论上不会命中旧 run 的目录，
+        # 但保留清理逻辑作为双重保障。
         agent_session_dir = _OC_HOME / "agents" / agent_name.lower()
         if agent_session_dir.exists():
             shutil.rmtree(agent_session_dir, ignore_errors=True)
