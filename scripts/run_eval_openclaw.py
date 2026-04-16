@@ -306,6 +306,12 @@ async def _run_single_task(
             ["agents", "delete", agent_name.lower(), "--force"],
             timeout=15,
         )
+        # openclaw agents delete 只删注册信息，不删 session 文件目录。
+        # 如果不清理，agents add 重建同名 agent 时会继承旧 session（包括上次
+        # 卡住的 pending 交易上下文），导致本次评测从错误状态续跑。
+        agent_session_dir = _OC_HOME / "agents" / agent_name.lower()
+        if agent_session_dir.exists():
+            shutil.rmtree(agent_session_dir, ignore_errors=True)
 
         # 0.5 清理所有 active pact（避免 agent 复用旧 pact 导致评测无法检测 pact submit）
         await _revoke_active_pacts(item_id)
