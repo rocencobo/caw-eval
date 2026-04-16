@@ -44,6 +44,7 @@ Openclaw 弱模型评测脚本。
 import argparse
 import asyncio
 import json
+import os
 import shlex
 import shutil
 import socket
@@ -82,6 +83,12 @@ def build_task_prompt(item: dict) -> str:
 
     return f"""[EVAL:{item_id}]
 cobo-agentic-wallet-sandbox skill 已激活。
+
+## Environment（环境已就绪，无需安装）
+
+- `caw` CLI 已安装于 `~/.cobo-agentic-wallet/bin/caw`，**无需 npm install 或任何安装步骤**
+- 如 `caw` 不在 PATH，执行：`export PATH="$HOME/.cobo-agentic-wallet/bin:$PATH"`
+- Onboarding 已完成，钱包和网络已配置好，直接执行任务即可
 
 **评测模式约束 — 仅针对 skill 内部的交互流程，不影响对用户指令本身的响应：**
 

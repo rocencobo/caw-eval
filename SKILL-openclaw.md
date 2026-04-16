@@ -62,6 +62,56 @@ MODEL_FULL="<从 status 复制，如 volcengine/doubao-seed-2.0-code>"
 MODEL_SHORT="<短标识，如 doubao>"
 ```
 
+## Step 1.5: 钱包余额预检
+
+并行查询每台服务器的 caw 钱包余额，确认资金充足：
+
+```bash
+mkdir -p /tmp/oc-balance
+for spec in "${SERVERS[@]}"; do
+  IFS=':' read -r name zone project <<< "$spec"
+  (gcloud compute ssh --zone "$zone" "$name" --tunnel-through-iap --project "$project" \
+     -- "sudo su - ubuntu -c 'export PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.cobo-agentic-wallet/bin:\$PATH; caw wallet balance 2>&1'" > /tmp/oc-balance/$name.txt 2>&1
+  ) &
+done
+wait
+# 解析并汇总
+for f in /tmp/oc-balance/*.txt; do
+  name=$(basename $f .txt | sed 's/luochong-openclew-dev-v1-//')
+  python3 -c "
+import json
+raw = open('$f').read()
+idx = raw.find('{')
+if idx == -1: print(f'  {\"$name\"}: 无数据'); exit()
+d = json.loads(raw[idx:])
+for r in d.get('result', []):
+    print(f'  {\"$name\":30s} {r[\"token_id\"]:12s} available={r[\"amount\"]:>24s}')
+"
+done
+```
+
+**最低余额要求**（Ethereum Sepolia 评测）：
+- **SETH ≥ 0.1**（gas + swap/transfer 操作消耗）
+- **SETH_USDC ≥ 14**（DeFi 类 case 需要 USDC 做 deposit/bridge/stream）
+
+不足时的补充方法：
+- **SETH 不足**：从余额充裕的服务器转入（通过 `openclaw agent --agent main --message "转 X SETH 到 <地址>（Ethereum Sepolia）"`），或用 `caw faucet` 领测试币
+- **USDC 不足**：并行 SSH 到各服务器，用 `openclaw agent` 执行 swap。注意 prompt 需要明确授权，避免 agent 卡在确认环节：
+
+```bash
+MSG="把 0.005 ETH 换成 USDC（Ethereum Sepolia，Uniswap V3）。这是已授权操作，直接创建 pact 并执行，不需要确认。完成后告诉我拿到了多少 USDC 和交易 hash。"
+for spec in "${SERVERS[@]}"; do
+  IFS=':' read -r name zone project <<< "$spec"
+  (gcloud compute ssh --zone "$zone" "$name" --tunnel-through-iap --project "$project" \
+     -- "sudo su - ubuntu -c 'export PATH=/home/ubuntu/.npm-global/bin:/home/ubuntu/.cobo-agentic-wallet/bin:\$PATH; \
+     openclaw agent --agent main --message \"$MSG\" 2>&1'" > /tmp/oc-swap/$name.txt 2>&1
+  ) &
+done
+wait
+```
+
+当前 ETH ≈ $2336，0.005 ETH ≈ 11.6 USDC。swap 涉及 wrap→approve→swap 三步链上交易，单台约 2-5 分钟。
+
 ## Step 2: 并行 dispatch（动态队列模式，推荐）
 
 ```bash
@@ -131,6 +181,14 @@ RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
 
 详细步骤（含 judge subagent 编排、报告模板）参考 [references/run-eval-openclaw.md](./references/run-eval-openclaw.md)。
 
+## 新服务器快速搭建
+
+新建 openclaw 评测服务器（GCP 实例创建 → openclaw/caw 安装 → onboarding → 充值 → 验证）：
+
+→ [server-setup.md](./references/server-setup.md)
+
+---
+
 ## Troubleshooting
 
 | 问题 | 解决 |
@@ -145,3 +203,6 @@ RUN_NAME=eval-oc-${MODEL_SHORT}-$(date +%Y%m%d-%H%M)
 | `Agent "eval-xxx" already exists` | 上次异常残留。脚本已内置预清理，手动修复：`openclaw agents delete eval-xxx --force` |
 | `Loaded 0 judge result(s)` | judge_results.json 每条缺 `trace_id`/`item_id` 字段，需从 judge_req.json 补充后重新合并 |
 | SSH 阻塞等待过久 | 使用 `--fire-and-forget` + `--watch` 流水线模式，dispatch 立即返回 |
+| SETH 余额不足 | 从余额充裕的服务器用 openclaw agent 转入（`转 0.1 SETH 到 <地址>`），或 `caw faucet` |
+| USDC 余额不足 | Step 1.5 的 swap 脚本并行执行。prompt 必须含"已授权操作，不需要确认"，否则 agent 会卡在确认环节 |
+| swap agent 卡在确认 | 非交互模式下 agent 可能要求确认。确保 prompt 包含明确授权语句，或 SSH 进服务器用 `openclaw tui` 交互式操作 |

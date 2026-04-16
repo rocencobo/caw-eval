@@ -233,9 +233,82 @@ print(f'merged {len(results)} judge results')
 
 ## Step 5: 生成报告（Opus subagent）
 
-参考 [run-eval-cc.md](./run-eval-cc.md) 的 Step 9。启动 Opus subagent 写报告，但 openclaw 模式下：
-- **session 数据来自 Langfuse**：subagent 用 Langfuse Python SDK 拉取（参考 `score_traces.py` 的 `_fetch_observations` 实现）
-- 或者：把 Step 2 生成的 `judge_req.json`（含 session_text）传给 Opus 作为分析素材
+**必须**通过 Agent 工具启动 **Opus subagent** 写报告，主会话（Sonnet）不要直接写。
+
+**为什么用 Opus**：报告阶段需要跨 case 根因归纳、P0/P1 权衡判断、上线决策这类深度推理，Sonnet 可行但质量明显弱。Opus subagent 在隔离 context 中按需读产物，成本比主 Opus 直接写低约 40%。
+
+**Openclaw 模式差异**（相比 CC 评测）：
+- **session 数据来自 Langfuse**：subagent 通过 `judge_req.json`（含 session_text）获取 session 内容，无需本地 .jsonl 文件
+- **无 session_metrics.json**：Openclaw 评测不生成运行指标文件，报告中省略 Section 3（运行指标）
+- **Skill 路径**：使用 `cobo-agentic-wallet-sandbox`（非 `-dev`）
+
+### 5.1 主会话先整理"运行观察"
+
+在启动 Opus 之前，主会话自己写一段 briefing（Opus subagent 看不到主会话历史，必须显式传入）：
+
+- 哪些 case 失败/超时/需重试
+- 环境异常（余额、faucet、API 超时、pending 卡住等）
+- 跑了几轮，每轮有没有差异
+- 任何影响分析结论的元信息
+
+保存为临时变量或文件，注入到下面 prompt 的 `## 主会话观察` 段落。
+
+### 5.2 启动 Opus subagent
+
+```python
+Agent(
+    subagent_type="general-purpose",
+    model="opus",
+    description="生成 CAW 评测报告",
+    prompt=f"""基于以下产物写 EVAL_REPORT.md。主会话已跑完评测，你负责深度分析。
+
+## 产物路径
+- Judge 结果: ~/.caw-eval/runs/{{run_name}}/judge_results.json（N case × 6 维度 score + reasoning）
+- Judge 请求（含 session_text）: ~/.caw-eval/runs/{{run_name}}/judge_req.json
+- Skill 源文件: {{repo}}/cobo-agent-wallet/sdk/skills/cobo-agentic-wallet-sandbox/
+  - SKILL.md, references/pact.md, references/error-handling.md, references/security.md
+- 报告模板参考: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-eval-oc-doubao-20260415-eth-v1.md
+- 输出路径: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{{run_name}}.md
+
+## 主会话观察（重要，你看不到主会话历史但需要这些信息）
+- 执行模型: {{model_full}}
+- 运行轮次: {{n_runs}}
+- 数据集: {{dataset_name}}
+- 环境: Openclaw, {{server_info}}
+- 异常: {{observations}}
+
+## 分析要求
+- Sonnet baseline: {{sonnet_baseline_e2e}} ({{sonnet_baseline_run}})
+
+1. 先 Read judge_results.json 全文，按 e2e_composite 从低到高排序
+2. 低分 case（<0.6）必须从 judge_req.json 中读对应 item 的 session_text 追根因；高分 case 不需读 session
+3. 遇到疑似 skill 指令缺陷时，Read 对应 skill 文件验证（不要猜）
+4. P0/P1/P2 按"风险严重度 × 发生频率 × 修复成本"排序，每条附依据
+5. 上线建议三选一：可上 / 有条件上 / 建议延期，附理由
+6. 报告末尾新增 Section：**修复收益预测**——对本次 P0/P1 问题逐一估算修复后 E2E 变化
+
+## 产出约束
+- 所有断言必须指向具体 case / tx / 代码行，避免空泛评价
+- 失败 case 用"现象 → 根因 → Action Item"三段式
+- 报告结构参考模板，不要另创结构
+
+## 报告包含
+1. 总览（E2E 综合分 + 任务完成率 + 与 baseline 对比）
+2. 逐 Case 评分（按 E2E 从高到低）
+3. 逐 Case 详细分析（仅低分 case 深入，高分 case 一行总结）
+4. 按场景类型分析（transfer/swap/lend/dca/nft/bridge/stream/multi_step/should_refuse）
+5. 阶段瓶颈分析（S1/S2/S3/TC）
+6. 高频失败模式
+7. 与基线对比分析
+8. 改进建议（P0/P1/P2 分级，每条附理由）
+9. 修复收益预测
+"""
+)
+```
+
+**模型选择说明**：
+- 如果只想快速出草稿、人工过后 review，可将 `model="opus"` 改为 `model="sonnet"`（成本再降 60%，报告质量降级约 15%，关键 P0 判断和上线决策质量损失明显）。
+- 若需严格成本控制，先用 `model="sonnet"` 出草稿，再用 `model="opus"` 启第二个 subagent 仅对"P0/P1 建议 + 上线决策"两段做 refine。
 
 报告输出到：
 ```

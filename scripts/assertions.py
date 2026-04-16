@@ -147,18 +147,44 @@ def _is_server_error(result_text: str) -> bool:
 def _extract_pact_flags_from_output(result_text: str) -> dict[str, str]:
     """从 shell 脚本输出中提取 pact submit 结果。
 
-    当 agent 通过 exec ./script.sh 间接调用 caw pact submit 时，
+    当 agent 通过 exec ./script.sh 或 $CAW 变量调用 caw pact submit 时，
     command_str 不含 caw 关键词，但输出包含 pact submit 的 JSON 结果。
     此函数从输出中解析 pact_id 等信息，使断言能检测到间接提交的 pact。
+
+    处理多种输出格式：
+    - 单个 JSON 对象（标准格式）
+    - 多个 JSON 对象连接（多次 process poll 合并，json.loads 报 Extra data）
+    - 带 shell 变量前缀（如 PACT_OUT={...}、TX_GET_02={...}）
+
+    只匹配 pact submit 成功响应格式：
+      {"result": {"pact_id": "...", ...}, "success": true}
+    不匹配 tx get 响应（其 pact_id 字段是授权 pact 的引用，非提交结果）。
     """
-    try:
-        data = json.loads(result_text)
-        result = data.get("result", data)
-        if isinstance(result, dict) and result.get("pact_id"):
-            # 输出是 pact submit 的成功结果，标记为间接检测
-            return {"_indirect": "true", "_pact_id": result["pact_id"]}
-    except (json.JSONDecodeError, TypeError):
-        pass
+    decoder = json.JSONDecoder()
+    text = result_text.strip()
+    pos = 0
+    while pos < len(text):
+        next_brace = text.find("{", pos)
+        if next_brace == -1:
+            break
+        try:
+            data, end_pos = decoder.raw_decode(text, next_brace)
+        except json.JSONDecodeError:
+            pos = next_brace + 1
+            continue
+
+        pos = end_pos
+
+        if not isinstance(data, dict):
+            continue
+
+        # Pact submit 成功响应格式: {"result": {"pact_id": "...", ...}, "success": true}
+        # tx get 响应没有 "success" 字段，pact_id 只是授权 pact 的引用，不应匹配
+        if data.get("success") is True:
+            result = data.get("result", {})
+            if isinstance(result, dict) and result.get("pact_id"):
+                return {"_indirect": "true", "_pact_id": result["pact_id"]}
+
     return {}
 
 

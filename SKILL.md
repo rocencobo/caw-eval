@@ -95,6 +95,12 @@ process_quality = S1(意图) × 0.15 + S2(Pact) × 0.45 + S3(执行) × 0.4
 - 可通过 `--dataset-name` 指定其他数据集
 - 已有数据集和创建新数据集参见 [dataset-management.md](./references/dataset-management.md)
 
+## 服务器环境搭建
+
+新建 openclaw 服务器时（安装 openclaw / caw / langfuse / 钱包 onboarding / 充值）：
+
+→ [server-setup.md](./references/server-setup.md)
+
 ## Scripts
 
 | 脚本 | 用途 |

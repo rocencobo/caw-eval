@@ -100,7 +100,7 @@ def _make_langfuse() -> Any:
             "(or LANGFUSE_DATASET_PUBLIC_KEY + LANGFUSE_DATASET_SECRET_KEY)."
         )
 
-    return Langfuse(public_key=public_key, secret_key=secret_key, host=host)
+    return Langfuse(public_key=public_key, secret_key=secret_key, host=host, timeout=120)
 
 
 # Alias for dataset reads — same project

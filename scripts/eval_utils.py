@@ -49,6 +49,7 @@ def get_langfuse_client() -> Langfuse:
         public_key=pub,
         secret_key=sec,
         host=host,
+        timeout=120,
     )
 
 

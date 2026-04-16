@@ -226,21 +226,22 @@ Agent(
 - Session 原文: ~/.caw-eval/runs/{{run_name}}/E2E-*.jsonl
 - Skill 源文件: {{repo}}/cobo-agent-wallet/sdk/skills/cobo-agentic-wallet-dev/
   - SKILL.md, references/pact.md, references/error-handling.md, references/security.md
-- 报告模板参考: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-20260411-sonnet-seth-v2.md
-- 输出路径: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{{run_name}}-seth-v2.md
+- 报告模板参考: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-eval-cc-sonnet-20260416-l2-v1.md
+- 输出路径: cobo-agent-wallet/sdk/skills/caw-eval/reports/eval-report-{{run_name}}.md
 
 ## 主会话观察（重要，你看不到主会话历史但需要这些信息）
 - 运行轮次: {{n_runs}}
 - 异常: {{observations}}
-- baseline（历史 eval-run-20260408）: E2E=7.23, S1=7.06, S2=8.13, S3=6.41（S3 为主要瓶颈）
 
-## 分析要求
+## 分析要求- L2 数据集最新 baseline: E2E=0.867, TC=0.770（eval-cc-sonnet-20260416-0524）
+
 1. 先 Read judge_results.json 全文，按 e2e_composite 从低到高排序
 2. 先 Read session_metrics.json 全文，用于 Section 3 运行指标（不需要自己从 session 中统计）
 3. 低分 case（<0.6）必须 Read 对应 session 追根因；高分 case 不需读 session
 4. 遇到疑似 skill 指令缺陷时，Read 对应 skill 文件验证（不要猜）
 5. P0/P1/P2 按"风险严重度 × 发生频率 × 修复成本"排序，每条附依据
 6. 上线建议三选一：可上 / 有条件上 / 建议延期，附理由
+7. 报告末尾新增 Section：**修复收益预测**——对本次 P0/P1 问题逐一估算修复后 E2E 变化（参考 eval-report-eval-cc-sonnet-20260416-l2-v1.md 第 9 节的格式）
 
 ## 产出约束
 - 所有断言必须指向具体 case / tx / 代码行，避免空泛评价
